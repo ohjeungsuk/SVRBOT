@@ -14,49 +14,8 @@ client.on('message', async message => {
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  // // !팀 명령어
-  // if (command === '팀') {
-  //   const n = parseInt(args[0]);
-  //   if (isNaN(n) || n < 1) return message.reply('올바른 인원 수를 입력해주세요.');
-
-  //   const voiceChannel = message.member.voice.channel;
-  //   if (!voiceChannel) return message.reply('음성 채널에 들어가 주세요.');
-
-  //   const members = voiceChannel.members.array().filter(member => !member.user.bot && !member.voice.mute);
-  //   if (members.length < n) return message.reply('음성 채널에 인원이 부족합니다.');
-
-  //   const shuffledMembers = members.sort(() => Math.random() - 0.5);
-  //   const teams = [];
-  //   let restMembers = shuffledMembers.length;
-
-  //   while (restMembers > 0) {
-  //     const teamSize = Math.min(restMembers, n);
-  //     const teamMembers = shuffledMembers.slice(teams.length * n, teams.length * n + teamSize);
-  //     teams.push(teamMembers.map(member => member.displayName));
-  //     restMembers -= teamSize;
-  //   }
-
-  //   latestTeams = teams; // !시작 명령어용으로 저장
-
-  //   const selectedTeamIndex = Math.floor(Math.random() * teams.length);
-  //   const selectedTeamName = `${selectedTeamIndex + 1} 팀`;
-  //   const randomMessage = `${selectedTeamName}이 좀 치네...?`;
-
-  //   let teamMessage = `**새로운 팀이 구성되었습니다!**\n나와 함께 할 팀은???\n\n`;
-
-  //   teams.forEach((team, i) => {
-  //     teamMessage += `\`\`\`\nTeam ${i + 1}\n`;
-  //     team.forEach(name => {
-  //       teamMessage += `${name}\n`;
-  //     });
-  //     teamMessage += `\`\`\`\n`;
-  //   });
-
-  //   message.channel.send(teamMessage);
-  //   message.channel.send(randomMessage);
-  // }
-
   // !팀 명령어
+// !팀 명령어
 if (command === '팀') {
   const n = parseInt(args[0]);
   if (isNaN(n) || n < 1) return message.reply('올바른 인원 수를 입력해주세요.');
@@ -66,11 +25,11 @@ if (command === '팀') {
 
   const SPECTATOR_TAG = /\[관전\]/i;
 
-  // 관전 태그, 봇, 서버 음소거 제외
+  // 봇, 관전 태그만 제외 (마이크 mute 조건 제거)
   const members = voiceChannel.members
     .filter(m => {
       const name = m.displayName || m.user.username || '';
-      return !m.user.bot && !m.voice.mute && !SPECTATOR_TAG.test(name);
+      return !m.user.bot && !SPECTATOR_TAG.test(name);
     })
     .array();
 
@@ -103,6 +62,7 @@ if (command === '팀') {
   message.channel.send(teamMessage);
   message.channel.send(randomMessage);
 }
+
 
 
   // !시작 명령어 - 팀원 강제 이동
