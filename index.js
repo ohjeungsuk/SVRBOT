@@ -1,8 +1,3 @@
-// index.js (discord.js v12 + google sheets logger)
-// Env vars needed on Heroku:
-// - DISCORD_TOKEN
-// - GOOGLE_SA_JSON_B64
-
 const Discord = require('discord.js');
 const { google } = require('googleapis');
 
