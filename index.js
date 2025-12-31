@@ -1,78 +1,353 @@
+// index.js (discord.js v12.5.3 + Google Sheets logger)
+// Required Heroku Config Vars:
+// - DISCORD_TOKEN
+// - GOOGLE_SA_JSON_B64
+//
+// Notes:
+// - Do NOT run both web and worker dynos at the same time (it will run the bot twice).
+//   Recommended: worker=1, web=0
+
 const Discord = require('discord.js');
-const client = new Discord.Client();
-const prefix = '!';
+const { google } = require('googleapis');
 
-let latestTeams = []; // !팀 명령으로 구성된 최신 팀 정보를 저장
-
-client.on('ready', () => {
-  console.log(`Logged in as ${client.user.tag}!`);
+const client = new Discord.Client({
+  partials: ['MESSAGE', 'CHANNEL', 'REACTION'],
 });
 
-client.on('message', async message => {
-  if (!message.content.startsWith(prefix) || message.author.bot) return;
+const prefix = '!';
+let latestTeams = []; // !팀 명령으로 구성된 최신 팀 정보를 저장
+
+// ---- Sheet Logger Settings ----
+const TARGET_CHANNEL_ID = '1362990551850418316'; // 여기 바뀜
+const SPREADSHEET_ID = '1aXIUb5yMA92s5EoYuyxf5IM8yFa_hryihUJDFIjsxyU';
+
+// 시트 탭 이름 고정(권장). 너 로그에서 "시트1" 이라고 떴으니 고정해도 됨.
+// 만약 탭 이름이 다르면 여기만 수정.
+const SHEET_TITLE_FIXED = '시트1'; // null로 두면 첫 탭 자동탐색
+
+// message_id -> row number cache (clears when dyno restarts)
+const msgRowCache = new Map();
+
+// serialize sheet operations
+let sheetQueue = Promise.resolve();
+function enqueueSheetJob(fn) {
+  sheetQueue = sheetQueue.then(fn).catch((err) => {
+    console.error('[SheetJobError]', err && err.stack ? err.stack : err);
+  });
+  return sheetQueue;
+}
+
+function getEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error('Missing env var: ' + name);
+  return v;
+}
+
+function safeShort(str, maxLen) {
+  if (!str) return '';
+  const s = String(str);
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen) + '...';
+}
+
+function parseServiceAccountFromB64() {
+  const b64 = getEnv('GOOGLE_SA_JSON_B64');
+  const jsonStr = Buffer.from(b64, 'base64').toString('utf8');
+  const creds = JSON.parse(jsonStr);
+
+  // private_key sometimes arrives with escaped newlines
+  if (creds.private_key) {
+    creds.private_key = creds.private_key.replace(/\\n/g, '\n');
+  }
+  return creds;
+}
+
+function buildMessageLink(message) {
+  const guildId = message.guild ? message.guild.id : '@me';
+  return (
+    'https://discord.com/channels/' +
+    guildId +
+    '/' +
+    message.channel.id +
+    '/' +
+    message.id
+  );
+}
+
+// thread 지원: parentID가 타겟 채널이면 true
+function isTargetChannelOrThread(message) {
+  if (!message || !message.channel) return false;
+
+  const cid = String(message.channel.id);
+  if (cid === TARGET_CHANNEL_ID) return true;
+
+  // thread인 경우 parentID가 실제 채널 ID
+  if (message.channel.parentID && String(message.channel.parentID) === TARGET_CHANNEL_ID) {
+    return true;
+  }
+  return false;
+}
+
+let sheetsApi = null;
+let SHEET_TITLE = null;
+
+async function initSheets() {
+  if (sheetsApi && SHEET_TITLE) return;
+
+  const creds = parseServiceAccountFromB64();
+  const auth = new google.auth.JWT({
+    email: creds.client_email,
+    key: creds.private_key,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+
+  sheetsApi = google.sheets({ version: 'v4', auth });
+
+  if (SHEET_TITLE_FIXED) {
+    SHEET_TITLE = SHEET_TITLE_FIXED;
+    console.log('[Sheets] SheetTitle(Fixed):', SHEET_TITLE);
+    return;
+  }
+
+  // auto resolve first tab
+  const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const sheets = meta && meta.data && meta.data.sheets ? meta.data.sheets : [];
+  if (!sheets.length || !sheets[0].properties || !sheets[0].properties.title) {
+    throw new Error('Cannot resolve sheet title');
+  }
+  SHEET_TITLE = sheets[0].properties.title;
+  console.log('[Sheets] SheetTitle(Auto):', SHEET_TITLE);
+}
+
+function extractRowNumberFromUpdatedRange(updatedRange) {
+  // example: "시트1!A12:H12"
+  if (!updatedRange) return null;
+  const m = updatedRange.match(/![A-Z]+(\d+):/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return isNaN(n) ? null : n;
+}
+
+async function appendMessageToSheet(message) {
+  await initSheets();
+
+  const createdAt = message.createdAt ? message.createdAt.toISOString() : '';
+  const editedAt = message.editedAt ? message.editedAt.toISOString() : '';
+  const author = message.author ? (message.author.tag || String(message.author)) : '';
+  const authorId = message.author ? String(message.author.id) : '';
+
+  const row = [
+    createdAt,                                      // created_at
+    editedAt,                                       // edited_at
+    author,                                         // author
+    authorId,                                       // author_id
+    String(message.channel.id),                     // channel_id
+    String(message.id),                             // message_id
+    message.content ? String(message.content) : '', // content
+    buildMessageLink(message),                      // message_link
+  ];
+
+  const range = SHEET_TITLE + '!A:H';
+
+  console.log(
+    '[Sheets][Append] try',
+    'mid=' + message.id,
+    'cid=' + message.channel.id,
+    'content=' + safeShort(message.content, 60)
+  );
+
+  const res = await sheetsApi.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: range,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [row] },
+  });
+
+  const updatedRange =
+    res && res.data && res.data.updates ? res.data.updates.updatedRange : null;
+  const rowNum = extractRowNumberFromUpdatedRange(updatedRange);
+
+  if (rowNum) msgRowCache.set(String(message.id), rowNum);
+
+  console.log(
+    '[Sheets][Append] ok',
+    'mid=' + message.id,
+    'row=' + (rowNum ? rowNum : 'unknown'),
+    'updatedRange=' + (updatedRange ? updatedRange : 'null')
+  );
+}
+
+async function findRowByMessageId(messageId) {
+  await initSheets();
+
+  const cached = msgRowCache.get(String(messageId));
+  if (cached) return cached;
+
+  // Search column F (message_id)
+  const range = SHEET_TITLE + '!F:F';
+  const res = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: range,
+    majorDimension: 'COLUMNS',
+  });
+
+  const col =
+    res && res.data && res.data.values && res.data.values[0] ? res.data.values[0] : [];
+
+  for (let i = 0; i < col.length; i++) {
+    if (String(col[i]) === String(messageId)) {
+      const rowNum = i + 1; // 1-based
+      msgRowCache.set(String(messageId), rowNum);
+      return rowNum;
+    }
+  }
+  return null;
+}
+
+async function updateEditedMessageInSheet(message) {
+  await initSheets();
+
+  const rowNum = await findRowByMessageId(message.id);
+  if (!rowNum) {
+    console.log('[Sheets][Edit] row not found. mid=' + message.id);
+    return;
+  }
+
+  const editedAt = message.editedAt
+    ? message.editedAt.toISOString()
+    : new Date().toISOString();
+
+  const content = message.content ? String(message.content) : '';
+
+  console.log(
+    '[Sheets][Edit] try',
+    'mid=' + message.id,
+    'row=' + rowNum,
+    'content=' + safeShort(content, 60)
+  );
+
+  const data = [
+    { range: SHEET_TITLE + '!B' + rowNum + ':B' + rowNum, values: [[editedAt]] }, // edited_at
+    { range: SHEET_TITLE + '!G' + rowNum + ':G' + rowNum, values: [[content]] },  // content
+  ];
+
+  await sheetsApi.spreadsheets.values.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      valueInputOption: 'RAW',
+      data: data,
+    },
+  });
+
+  console.log('[Sheets][Edit] ok', 'mid=' + message.id, 'row=' + rowNum);
+}
+
+// ---- Global Error Logs (Heroku logs에 반드시 찍히게) ----
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[unhandledRejection]', err && err.stack ? err.stack : err);
+});
+
+// ---- Discord Events ----
+client.on('ready', async () => {
+  console.log('[Bot] LoggedInAs:', client.user.tag);
+  console.log('[Bot] TARGET_CHANNEL_ID:', TARGET_CHANNEL_ID);
+
+  // env 존재 여부 로그(값 자체는 찍지 않음)
+  console.log('[Env] DISCORD_TOKEN:', process.env.DISCORD_TOKEN ? 'SET' : 'MISSING');
+  console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
+
+  try {
+    await initSheets();
+  } catch (e) {
+    console.error('[SheetsInitFailed]', e && e.stack ? e.stack : e);
+  }
+});
+
+// 메시지 작성 시 시트 append + 기존 명령 유지
+client.on('message', async (message) => {
+  if (!message || !message.author) return;
+  if (message.author.bot) return;
+
+  // 디버그 로그: 메시지 이벤트가 실제 들어오는지
+  // 타겟 채널(또는 그 스레드)만 로그 찍게 제한
+  if (isTargetChannelOrThread(message)) {
+    console.log(
+      '[MSG] recv',
+      'cid=' + message.channel.id,
+      'parent=' + (message.channel.parentID ? message.channel.parentID : 'none'),
+      'mid=' + message.id,
+      'content=' + safeShort(message.content, 80)
+    );
+
+    enqueueSheetJob(() => appendMessageToSheet(message));
+  }
+
+  // Commands
+  if (!message.content || !message.content.startsWith(prefix)) return;
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
   // !팀 명령어
-// !팀 명령어
-if (command === '팀') {
-  const n = parseInt(args[0]);
-  if (isNaN(n) || n < 1) return message.reply('올바른 인원 수를 입력해주세요.');
+  if (command === '팀') {
+    const n = parseInt(args[0], 10);
+    if (isNaN(n) || n < 1) return message.reply('올바른 인원 수를 입력해주세요.');
 
-  const voiceChannel = message.member.voice.channel;
-  if (!voiceChannel) return message.reply('음성 채널에 들어가 주세요.');
+    const voiceChannel = message.member.voice.channel;
+    if (!voiceChannel) return message.reply('음성 채널에 들어가 주세요.');
 
-  const SPECTATOR_TAG = /\[관전\]/i;
+    const SPECTATOR_TAG = /\[관전\]/i;
 
-  // 봇, 관전 태그만 제외 (마이크 mute 조건 제거)
-  const members = voiceChannel.members
-    .filter(m => {
-      const name = m.displayName || m.user.username || '';
-      return !m.user.bot && !SPECTATOR_TAG.test(name);
-    })
-    .array();
+    // 봇, 관전 태그만 제외 (마이크 mute 조건 제거)
+    const members = voiceChannel.members
+      .filter(m => {
+        const name = m.displayName || m.user.username || '';
+        return !m.user.bot && !SPECTATOR_TAG.test(name);
+      })
+      .array();
 
-  if (members.length < n) return message.reply('음성 채널에 인원이 부족합니다.');
+    if (members.length < n) return message.reply('음성 채널에 인원이 부족합니다.');
 
-  const shuffledMembers = members.sort(() => Math.random() - 0.5);
-  const teams = [];
-  let restMembers = shuffledMembers.length;
+    const shuffledMembers = members.sort(() => Math.random() - 0.5);
+    const teams = [];
+    let restMembers = shuffledMembers.length;
 
-  while (restMembers > 0) {
-    const teamSize = Math.min(restMembers, n);
-    const teamMembers = shuffledMembers.slice(teams.length * n, teams.length * n + teamSize);
-    teams.push(teamMembers.map(member => member.displayName));
-    restMembers -= teamSize;
+    while (restMembers > 0) {
+      const teamSize = Math.min(restMembers, n);
+      const teamMembers = shuffledMembers.slice(teams.length * n, teams.length * n + teamSize);
+      teams.push(teamMembers.map(member => member.displayName));
+      restMembers -= teamSize;
+    }
+
+    latestTeams = teams;
+
+    const selectedTeamIndex = Math.floor(Math.random() * teams.length);
+    const selectedTeamName = `${selectedTeamIndex + 1} 팀`;
+    const randomMessage = `${selectedTeamName}이 좀 치네...?`;
+
+    let teamMessage = `**새로운 팀이 구성되었습니다!**\n나와 함께 할 팀은???\n\n`;
+    teams.forEach((team, i) => {
+      teamMessage += `\`\`\`\nTeam ${i + 1}\n`;
+      team.forEach(name => { teamMessage += `${name}\n`; });
+      teamMessage += `\`\`\`\n`;
+    });
+
+    message.channel.send(teamMessage);
+    message.channel.send(randomMessage);
+    return;
   }
 
-  latestTeams = teams;
-
-  const selectedTeamIndex = Math.floor(Math.random() * teams.length);
-  const selectedTeamName = `${selectedTeamIndex + 1} 팀`;
-  const randomMessage = `${selectedTeamName}이 좀 치네...?`;
-
-  let teamMessage = `**새로운 팀이 구성되었습니다!**\n나와 함께 할 팀은???\n\n`;
-  teams.forEach((team, i) => {
-    teamMessage += `\`\`\`\nTeam ${i + 1}\n`;
-    team.forEach(name => { teamMessage += `${name}\n`; });
-    teamMessage += `\`\`\`\n`;
-  });
-
-  message.channel.send(teamMessage);
-  message.channel.send(randomMessage);
-}
-
-
-
-  // !시작 명령어 - 팀원 강제 이동
+  // !해산 명령어 - 팀원 강제 이동
   if (command === '해산') {
     if (latestTeams.length === 0) {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
     }
 
-
-    //순서대로 내전1부터 10까지 임
+    // 순서대로 내전1부터 10까지 임
     const voiceChannelIds = [
       '1450857003521015921', '1450857559715217560', '1450857466312261786',
       '1450857664388005980', '1450857791789989971', '1450857978289983568',
@@ -89,59 +364,92 @@ if (command === '팀') {
         const member = message.guild.members.cache.find(m => m.displayName === name);
         if (member && member.voice.channel) {
           member.voice.setChannel(channel).catch(err => {
-            console.error(`이동 실패: ${member.displayName}`, err.message);
+            console.error('이동 실패:', member.displayName, err.message);
           });
         }
       });
     });
 
     message.channel.send('모든 인원을 이동 시켰습니다!!! @here');
+    return;
   }
 
   // !놀자 명령어
-if (command === '놀자') {
-  const maxMembers = 4;
+  if (command === '놀자') {
+    const maxMembers = 4;
 
-  if (!message.member.voice.channel) {
-    return message.reply('먼저 음성 채널에 들어가주세요!');
+    if (!message.member.voice.channel) {
+      return message.reply('먼저 음성 채널에 들어가주세요!');
+    }
+
+    const voice = message.member.voice.channel;
+
+    // 닉네임/서버닉네임에 [관전] 포함된 멤버 제거, 봇도 제외
+    const SPECTATOR_TAG = /\[관전\]/i;
+    const effectiveMembers = voice.members.filter(m => {
+      const name = m.displayName || m.user.username || '';
+      return !m.user.bot && !SPECTATOR_TAG.test(name);
+    });
+
+    const currentMembers = effectiveMembers.size;
+    const remainingMembers = Math.max(maxMembers - currentMembers, 0);
+
+    // 초대 링크 생성 (1시간)
+    const invite = await voice.createInvite({
+      maxAge: 3600
+    });
+
+    const colors = ['#FF5733', '#C70039', '#900C3F', '#581845', '#2E86C1', '#2ECC71', '#F1C40F', '#8E44AD'];
+    const selectedColor = colors[Math.floor(Math.random() * colors.length)];
+
+    const inviteMessage = new Discord.MessageEmbed()
+      .setTitle(`:loud_sound: ${voice.name} 여기 왕따 있어요!!!! \n${remainingMembers} 명 구인 구직 중이에요`)
+      .setColor(selectedColor)
+      .setFooter('해당링크는 1시간 후 자동으로 소멸됩니다.')
+      .setTimestamp();
+
+    message.channel.send(inviteMessage);
+    message.channel.send(invite.url);
+    return;
   }
 
-  const voice = message.member.voice.channel;
-
-  // 닉네임/서버닉네임에 [관전] 포함된 멤버 제거, 봇도 제외
-  const SPECTATOR_TAG = /\[관전\]/i;
-  const effectiveMembers = voice.members.filter(m => {
-    const name = m.displayName || m.user.username || '';
-    return !m.user.bot && !SPECTATOR_TAG.test(name);
-  });
-
-  const currentMembers = effectiveMembers.size;                 // 관전 제외 후 현재 인원
-  const remainingMembers = Math.max(maxMembers - currentMembers, 0);
-
-  // 초대 링크 생성 (1시간)
-  const invite = await voice.createInvite({
-    maxAge: 3600
-  });
-
-  const colors = ['#FF5733', '#C70039', '#900C3F', '#581845', '#2E86C1', '#2ECC71', '#F1C40F', '#8E44AD'];
-  const selectedColor = colors[Math.floor(Math.random() * colors.length)];
-
-  const inviteMessage = new Discord.MessageEmbed()
-    .setTitle(`:loud_sound: ${voice.name} 여기 왕따 있어요!!!! \n${remainingMembers} 명 구인 구직 중이에요`)
-    .setColor(selectedColor)
-    .setFooter('해당링크는 1시간 후 자동으로 소멸됩니다.')
-    .setTimestamp();
-
-  message.channel.send(inviteMessage);
-  message.channel.send(invite.url);
-}
-
-  // !사용법 명령어
+  // !명령어
   if (message.content === '!명령어') {
     message.channel.send(
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
       `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함] \n 해당 봇 저작권은 도비에게 있습니다. `
     );
+    return;
   }
 });
-client.login('MTA2NDgwMjk4NjkyMjA4NjQ4MA.GzgnvZ.aWgSucVaeuNXIAMFUel2QXawpLim6lnJvnhjlM');
+
+// 메시지 수정 시 edited_at + content 업데이트
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+  try {
+    if (!newMessage) return;
+
+    // partial이면 fetch 시도
+    if (newMessage.partial) {
+      try { newMessage = await newMessage.fetch(); } catch (e) { return; }
+    }
+
+    if (!newMessage.author || newMessage.author.bot) return;
+
+    // 타겟 채널/스레드만 처리
+    if (!isTargetChannelOrThread(newMessage)) return;
+
+    console.log(
+      '[MSG_EDIT] recv',
+      'cid=' + newMessage.channel.id,
+      'parent=' + (newMessage.channel.parentID ? newMessage.channel.parentID : 'none'),
+      'mid=' + newMessage.id,
+      'content=' + safeShort(newMessage.content, 80)
+    );
+
+    enqueueSheetJob(() => updateEditedMessageInSheet(newMessage));
+  } catch (e) {
+    console.error('[messageUpdate handler error]', e && e.stack ? e.stack : e);
+  }
+});
+
+client.login(getEnv('DISCORD_TOKEN'));
