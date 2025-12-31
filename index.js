@@ -366,4 +366,8 @@ process.on('unhandledRejection', (err) => {
   console.error('UnhandledRejection:', err && err.message ? err.message : err);
 });
 
+
+// 디버그: 메시지를 받는지 확인
+console.log('MSG:', message.channel.id, message.channel.type, message.content);
+
 client.login(getEnv('DISCORD_TOKEN'));
