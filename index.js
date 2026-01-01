@@ -16,13 +16,13 @@ const prefix = '!';
 let latestTeams = [];
 
 // ---- Google Sheets Settings ----
-const TARGET_CHANNEL_ID = '1439239707320909895'; // 너 현재 설정
+const TARGET_CHANNEL_ID = '1439239707320909895';
 const SPREADSHEET_ID = '1aXIUb5yMA92s5EoYuyxf5IM8yFa_hryihUJDFIjsxyU';
 
-// 외출 목록 기록 탭
+// 외출 목록 기록 탭(실시간 기록용: 4컬럼)
 const SHEET_TITLE_FIXED = '카톡외출목록';
 
-// 백업 최대 메시지 수 (너무 큰 채널이면 무한히 걸릴 수 있어서 안전장치)
+// 백업 최대 메시지 수(안전장치)
 const BACKUP_MAX_MESSAGES = 20000;
 
 // sheet job serialize
@@ -89,9 +89,9 @@ function a1Range(sheetTitle, a1) {
 }
 
 // 입력 양식 파서
-// 닉네임: ...
-// 사유: ...
-// 기간: ...
+// 닉네임: 도비/98/TEST
+// 사유: 테스트입니다
+// 기간: 언젠간
 function parseLeaveForm(content) {
   if (!content) return null;
 
@@ -124,7 +124,7 @@ function parseLeaveForm(content) {
 let sheetsApi = null;
 let SHEET_TITLE = null;
 
-// message_id -> row number cache
+// message_id -> row number cache (실시간 기록용)
 const msgRowCache = new Map();
 
 async function initSheets() {
@@ -150,7 +150,7 @@ function extractRowNumberFromUpdatedRange(updatedRange) {
   return isNaN(n) ? null : n;
 }
 
-// 외출목록 행 추가: 닉네임/사유/기간/등록시간(KST)
+// 실시간 외출목록: 4컬럼 (닉네임/사유/기간/등록시간)
 async function appendLeaveRow(message) {
   await initSheets();
 
@@ -179,10 +179,10 @@ async function appendLeaveRow(message) {
   const rowNum = extractRowNumberFromUpdatedRange(updatedRange);
   if (rowNum) msgRowCache.set(String(message.id), rowNum);
 
-  console.log('[Leave][Append] ok', 'mid=' + message.id, 'row=' + (rowNum ? rowNum : 'unknown'), 'updatedRange=' + (updatedRange ? updatedRange : 'null'));
+  console.log('[Leave][Append] ok', 'mid=' + message.id, 'row=' + (rowNum ? rowNum : 'unknown'));
 }
 
-// 메시지 수정 시 (캐시에 row가 있는 경우만) A~C 업데이트
+// 메시지 수정 시(캐시에 row가 있는 경우만) A~C 업데이트
 async function updateLeaveRowFromEdit(message) {
   await initSheets();
 
@@ -212,13 +212,12 @@ async function updateLeaveRowFromEdit(message) {
   console.log('[Leave][Edit] ok', 'mid=' + message.id, 'row=' + rowNum);
 }
 
-// ---------- Backup 기능 ----------
+// ---------- Backup 기능 (3컬럼만 저장) ----------
 let backupRunning = false;
 
 async function getOrFetchChannel(channelId) {
   let ch = client.channels.cache.get(channelId);
   if (ch) return ch;
-  // v12 supports fetch
   try {
     ch = await client.channels.fetch(channelId);
     return ch;
@@ -239,7 +238,6 @@ async function listSheetTitles() {
 }
 
 function makeBackupBaseTitle(nowKST) {
-  // nowKST: "YYYY-MM-DD HH:mm:ss" -> use date only
   const d = nowKST.slice(0, 10);
   return '백업(' + d + ')';
 }
@@ -252,7 +250,6 @@ function makeUniqueTitle(base, existingTitles) {
     if (existingTitles.indexOf(t) < 0) return t;
     idx++;
   }
-  // 마지막 수단
   return base + '-' + new Date().getTime();
 }
 
@@ -264,9 +261,7 @@ async function createSheetTab(title) {
     requestBody: {
       requests: [
         {
-          addSheet: {
-            properties: { title: title },
-          },
+          addSheet: { properties: { title: title } },
         },
       ],
     },
@@ -275,9 +270,8 @@ async function createSheetTab(title) {
   console.log('[Backup] sheet tab created:', title);
 }
 
-async function appendRowsToSheet(sheetTitle, rows) {
-  // rows: [ [..], [..] ... ]
-  const range = a1Range(sheetTitle, 'A:I');
+async function appendRowsToSheet(sheetTitle, rows, a1) {
+  const range = a1Range(sheetTitle, a1);
   await sheetsApi.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
     range: range,
@@ -288,7 +282,6 @@ async function appendRowsToSheet(sheetTitle, rows) {
 }
 
 async function fetchAllMessagesFromChannelText(channel) {
-  // 최신 -> 과거 방향으로 100개씩 fetch, 끝까지
   const all = [];
   let lastId = null;
 
@@ -306,7 +299,7 @@ async function fetchAllMessagesFromChannelText(channel) {
 
     if (!batch || batch.size === 0) break;
 
-    const arr = batch.array(); // v12
+    const arr = batch.array();
     for (let i = 0; i < arr.length; i++) {
       all.push(arr[i]);
     }
@@ -338,85 +331,67 @@ async function runBackup(invokingMessage) {
       return;
     }
 
-    // 새 시트 이름 생성
     const nowKST = formatKSTFromDate(new Date());
     const base = makeBackupBaseTitle(nowKST);
     const existing = await listSheetTitles();
     const newTitle = makeUniqueTitle(base, existing);
 
-    // 시트 탭 생성
     await createSheetTab(newTitle);
 
-    // 헤더
-    const header = [
-      'created_at_kst',
-      'edited_at_kst',
-      'author',
-      'author_id',
-      'channel_id',
-      'message_id',
-      'content',
-      'message_link',
-      'attachments'
-    ];
-    await appendRowsToSheet(newTitle, [header]);
+    // 백업 시트는 3컬럼만
+    // 닉네임 / 사유 / 외출날짜(=기간)
+    const header = ['닉네임', '사유', '외출날짜'];
+    await appendRowsToSheet(newTitle, [header], 'A:C');
 
     console.log('[Backup] fetching messages from channel:', TARGET_CHANNEL_ID);
 
     const msgs = await fetchAllMessagesFromChannelText(ch);
-
     if (!msgs || msgs.length === 0) {
-      console.log('[Backup] no messages fetched');
       try { await invokingMessage.reply('백업 완료(0건). 새 시트: ' + newTitle); } catch (e) {}
       return;
     }
 
-    // 과거 -> 최신 순으로 저장하려면 reverse
+    // 과거 -> 최신
     msgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 
     console.log('[Backup] total messages fetched:', msgs.length);
 
-    // rows 만들기
+    // 양식 메시지들만 뽑아서 3컬럼 row로 변환
     const rows = [];
+    let matched = 0;
+
     for (let i = 0; i < msgs.length; i++) {
       const m = msgs[i];
+      const parsed = parseLeaveForm(m.content);
+      if (!parsed) continue;
 
-      const createdKST = m.createdAt ? formatKSTFromDate(m.createdAt) : '';
-      const editedKST = m.editedAt ? formatKSTFromDate(m.editedAt) : '';
-      const author = m.author ? (m.author.tag || '') : '';
-      const authorId = m.author ? String(m.author.id) : '';
-      const channelId = String(m.channel.id);
-      const messageId = String(m.id);
-      const content = m.content ? String(m.content) : '';
+      matched++;
+      rows.push([parsed.nickname, parsed.reason, parsed.period]);
 
-      let attach = '';
-      try {
-        if (m.attachments && m.attachments.size > 0) {
-          const a = m.attachments.array().map(x => x.url);
-          attach = a.join(' ');
-        }
-      } catch (e) {}
-
-      const link = buildMessageLink(m);
-
-      rows.push([createdKST, editedKST, author, authorId, channelId, messageId, content, link, attach]);
-
-      if ((i + 1) % 500 === 0) {
-        console.log('[Backup] prepared rows:', i + 1);
+      if (matched % 500 === 0) {
+        console.log('[Backup] matched rows:', matched);
       }
     }
 
-    // 시트로 batch append (500줄씩)
+    if (rows.length === 0) {
+      console.log('[Backup] no matched leave-form messages');
+      try { await invokingMessage.reply('백업 완료(양식 0건). 새 시트: ' + newTitle); } catch (e) {}
+      return;
+    }
+
+    // 500줄씩 append
     const CHUNK = 500;
     for (let s = 0; s < rows.length; s += CHUNK) {
       const chunk = rows.slice(s, s + CHUNK);
-      await appendRowsToSheet(newTitle, chunk);
-      console.log('[Backup] appended to sheet:', Math.min(s + CHUNK, rows.length) + '/' + rows.length);
+      await appendRowsToSheet(newTitle, chunk, 'A:C');
+      console.log('[Backup] appended:', Math.min(s + CHUNK, rows.length) + '/' + rows.length);
     }
 
-    console.log('[Backup] done. sheet:', newTitle);
+    console.log('[Backup] done. sheet:', newTitle, 'matched:', rows.length);
 
-    try { await invokingMessage.reply('백업 완료: ' + rows.length + '건, 새 시트: ' + newTitle); } catch (e) {}
+    try {
+      await invokingMessage.reply('백업 완료: 양식 ' + rows.length + '건, 새 시트: ' + newTitle);
+    } catch (e) {}
   } catch (e) {
     console.error('[Backup] failed:', e && e.stack ? e.stack : e);
     try { await invokingMessage.reply('백업 실패. Heroku 로그 확인해줘.'); } catch (ee) {}
@@ -456,12 +431,10 @@ client.on('message', async (message) => {
     console.log(
       '[MSG] recv',
       'cid=' + message.channel.id,
-      'parent=' + (message.channel.parentID ? message.channel.parentID : 'none'),
       'mid=' + message.id,
       'created(KST)=' + formatKSTFromDate(message.createdAt),
       'content=' + safeShort(message.content, 140)
     );
-
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
@@ -471,17 +444,14 @@ client.on('message', async (message) => {
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  // !백업: 지정 채널 전체 메시지를 새 시트로 백업
+  // !백업: 지정 채널에서 "양식 메시지"만 뽑아서 3컬럼으로 새 시트에 저장
   if (command === '백업') {
     console.log('[Backup] command received by', message.author.tag);
-    // 백업은 시간이 걸리니까 별도 실행
     runBackup(message);
     return;
   }
 
-  // ---------------- 기존 기능들 유지 ----------------
-
-  // !팀
+  // ---- 기존 기능들 ----
   if (command === '팀') {
     const n = parseInt(args[0], 10);
     if (isNaN(n) || n < 1) return message.reply('올바른 인원 수를 입력해주세요.');
@@ -528,7 +498,6 @@ client.on('message', async (message) => {
     return;
   }
 
-  // !해산
   if (command === '해산') {
     if (latestTeams.length === 0) {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
@@ -560,7 +529,6 @@ client.on('message', async (message) => {
     return;
   }
 
-  // !놀자
   if (command === '놀자') {
     const maxMembers = 4;
 
@@ -595,7 +563,6 @@ client.on('message', async (message) => {
     return;
   }
 
-  // !명령어
   if (message.content === '!명령어') {
     message.channel.send(
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
@@ -618,7 +585,6 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     if (!isTargetChannelOrThread(newMessage)) return;
 
     console.log('[MSG_EDIT] recv', 'mid=' + newMessage.id, 'content=' + safeShort(newMessage.content, 140));
-
     enqueueSheetJob(() => updateLeaveRowFromEdit(newMessage));
   } catch (e) {
     console.error('[messageUpdate handler error]', e && e.stack ? e.stack : e);
