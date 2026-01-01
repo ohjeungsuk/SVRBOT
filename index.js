@@ -1,11 +1,9 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger)
+// index.js (discord.js v12.5.3 + Google Sheets logger for "카톡외출목록")
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
 //
-// Notes:
-// - Do NOT run both web and worker dynos at the same time (it will run the bot twice).
-//   Recommended: worker=1, web=0
+// Recommended Heroku dynos: worker=1, web=0 (avoid double running)
 
 const Discord = require('discord.js');
 const { google } = require('googleapis');
@@ -17,18 +15,17 @@ const client = new Discord.Client({
 const prefix = '!';
 let latestTeams = []; // !팀 명령으로 구성된 최신 팀 정보를 저장
 
-// ---- Sheet Logger Settings ----
-const TARGET_CHANNEL_ID = '1362990551850418316'; // 여기 바뀜
+// ---- Google Sheets Settings ----
+const TARGET_CHANNEL_ID = '1362990551850418316';
 const SPREADSHEET_ID = '1aXIUb5yMA92s5EoYuyxf5IM8yFa_hryihUJDFIjsxyU';
 
-// 시트 탭 이름 고정(권장). 너 로그에서 "시트1" 이라고 떴으니 고정해도 됨.
-// 만약 탭 이름이 다르면 여기만 수정.
-const SHEET_TITLE_FIXED = '시트1'; // null로 두면 첫 탭 자동탐색
+// 여기에 기록할 시트 탭 이름
+const SHEET_TITLE_FIXED = '카톡외출목록';
 
-// message_id -> row number cache (clears when dyno restarts)
+// message_id -> row number cache (dyno 재시작하면 초기화됨)
 const msgRowCache = new Map();
 
-// serialize sheet operations
+// sheet job serialize
 let sheetQueue = Promise.resolve();
 function enqueueSheetJob(fn) {
   sheetQueue = sheetQueue.then(fn).catch((err) => {
@@ -62,16 +59,13 @@ function parseServiceAccountFromB64() {
   return creds;
 }
 
-function buildMessageLink(message) {
-  const guildId = message.guild ? message.guild.id : '@me';
-  return (
-    'https://discord.com/channels/' +
-    guildId +
-    '/' +
-    message.channel.id +
-    '/' +
-    message.id
-  );
+// "한국시간" 문자열 (YYYY-MM-DD HH:mm:ss)
+function formatKSTFromDate(dateObj) {
+  // KST = UTC + 9, Korea has no DST
+  const t = new Date(dateObj.getTime() + 9 * 60 * 60 * 1000);
+  const iso = t.toISOString(); // shifted-utc
+  // "YYYY-MM-DDTHH:mm:ss.sssZ" -> "YYYY-MM-DD HH:mm:ss"
+  return iso.slice(0, 19).replace('T', ' ');
 }
 
 // thread 지원: parentID가 타겟 채널이면 true
@@ -81,11 +75,53 @@ function isTargetChannelOrThread(message) {
   const cid = String(message.channel.id);
   if (cid === TARGET_CHANNEL_ID) return true;
 
-  // thread인 경우 parentID가 실제 채널 ID
   if (message.channel.parentID && String(message.channel.parentID) === TARGET_CHANNEL_ID) {
     return true;
   }
   return false;
+}
+
+function a1Range(sheetTitle, a1) {
+  // quote sheet title safely: '카톡외출목록'!A:D
+  const safe = String(sheetTitle).replace(/'/g, "''");
+  return "'" + safe + "'!" + a1;
+}
+
+// 입력 양식 파서
+// 기대 형식:
+// 닉네임: 도비/98/TEST
+// 사유: 테스트입니다
+// 기간: 언젠간
+function parseLeaveForm(content) {
+  if (!content) return null;
+
+  const lines = String(content)
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  let nickname = '';
+  let reason = '';
+  let period = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // "키: 값" 형태만 받음
+    const m = line.match(/^([^:]+)\s*:\s*(.*)$/);
+    if (!m) continue;
+
+    const key = String(m[1]).replace(/\s/g, ''); // 공백 제거
+    const val = String(m[2]).trim();
+
+    if (key === '닉네임') nickname = val;
+    else if (key === '사유') reason = val;
+    else if (key === '기간') period = val;
+  }
+
+  if (!nickname || !reason || !period) return null;
+
+  return { nickname, reason, period };
 }
 
 let sheetsApi = null;
@@ -103,24 +139,12 @@ async function initSheets() {
 
   sheetsApi = google.sheets({ version: 'v4', auth });
 
-  if (SHEET_TITLE_FIXED) {
-    SHEET_TITLE = SHEET_TITLE_FIXED;
-    console.log('[Sheets] SheetTitle(Fixed):', SHEET_TITLE);
-    return;
-  }
-
-  // auto resolve first tab
-  const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  const sheets = meta && meta.data && meta.data.sheets ? meta.data.sheets : [];
-  if (!sheets.length || !sheets[0].properties || !sheets[0].properties.title) {
-    throw new Error('Cannot resolve sheet title');
-  }
-  SHEET_TITLE = sheets[0].properties.title;
-  console.log('[Sheets] SheetTitle(Auto):', SHEET_TITLE);
+  SHEET_TITLE = SHEET_TITLE_FIXED;
+  console.log('[Sheets] SheetTitle(Fixed):', SHEET_TITLE);
 }
 
 function extractRowNumberFromUpdatedRange(updatedRange) {
-  // example: "시트1!A12:H12"
+  // example: "'카톡외출목록'!A12:D12" or "카톡외출목록!A12:D12"
   if (!updatedRange) return null;
   const m = updatedRange.match(/![A-Z]+(\d+):/);
   if (!m) return null;
@@ -128,32 +152,33 @@ function extractRowNumberFromUpdatedRange(updatedRange) {
   return isNaN(n) ? null : n;
 }
 
-async function appendMessageToSheet(message) {
+// 카톡외출목록에 행 추가: 닉네임/사유/기간/등록시간(KST)
+async function appendLeaveRow(message) {
   await initSheets();
 
-  const createdAt = message.createdAt ? message.createdAt.toISOString() : '';
-  const editedAt = message.editedAt ? message.editedAt.toISOString() : '';
-  const author = message.author ? (message.author.tag || String(message.author)) : '';
-  const authorId = message.author ? String(message.author.id) : '';
+  const parsed = parseLeaveForm(message.content);
+  if (!parsed) {
+    console.log(
+      '[Leave][Skip] format not matched',
+      'cid=' + message.channel.id,
+      'mid=' + message.id,
+      'content=' + safeShort(message.content, 120)
+    );
+    return;
+  }
 
-  const row = [
-    createdAt,                                      // created_at
-    editedAt,                                       // edited_at
-    author,                                         // author
-    authorId,                                       // author_id
-    String(message.channel.id),                     // channel_id
-    String(message.id),                             // message_id
-    message.content ? String(message.content) : '', // content
-    buildMessageLink(message),                      // message_link
-  ];
+  const registeredAtKST = formatKSTFromDate(message.createdAt);
 
-  const range = SHEET_TITLE + '!A:H';
+  // 시트 컬럼: 닉네임 | 사유 | 기간 | 등록시간
+  const row = [parsed.nickname, parsed.reason, parsed.period, registeredAtKST];
+
+  const range = a1Range(SHEET_TITLE, 'A:D');
 
   console.log(
-    '[Sheets][Append] try',
+    '[Leave][Append] try',
     'mid=' + message.id,
-    'cid=' + message.channel.id,
-    'content=' + safeShort(message.content, 60)
+    'nick=' + safeShort(parsed.nickname, 30),
+    'time(KST)=' + registeredAtKST
   );
 
   const res = await sheetsApi.spreadsheets.values.append({
@@ -166,81 +191,53 @@ async function appendMessageToSheet(message) {
 
   const updatedRange =
     res && res.data && res.data.updates ? res.data.updates.updatedRange : null;
-  const rowNum = extractRowNumberFromUpdatedRange(updatedRange);
 
+  const rowNum = extractRowNumberFromUpdatedRange(updatedRange);
   if (rowNum) msgRowCache.set(String(message.id), rowNum);
 
   console.log(
-    '[Sheets][Append] ok',
+    '[Leave][Append] ok',
     'mid=' + message.id,
     'row=' + (rowNum ? rowNum : 'unknown'),
     'updatedRange=' + (updatedRange ? updatedRange : 'null')
   );
 }
 
-async function findRowByMessageId(messageId) {
+// 메시지 수정 시 (dyno 재시작 전/캐시 있는 경우에만) A~C 업데이트
+async function updateLeaveRowFromEdit(message) {
   await initSheets();
 
-  const cached = msgRowCache.get(String(messageId));
-  if (cached) return cached;
-
-  // Search column F (message_id)
-  const range = SHEET_TITLE + '!F:F';
-  const res = await sheetsApi.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: range,
-    majorDimension: 'COLUMNS',
-  });
-
-  const col =
-    res && res.data && res.data.values && res.data.values[0] ? res.data.values[0] : [];
-
-  for (let i = 0; i < col.length; i++) {
-    if (String(col[i]) === String(messageId)) {
-      const rowNum = i + 1; // 1-based
-      msgRowCache.set(String(messageId), rowNum);
-      return rowNum;
-    }
-  }
-  return null;
-}
-
-async function updateEditedMessageInSheet(message) {
-  await initSheets();
-
-  const rowNum = await findRowByMessageId(message.id);
+  const rowNum = msgRowCache.get(String(message.id));
   if (!rowNum) {
-    console.log('[Sheets][Edit] row not found. mid=' + message.id);
+    console.log('[Leave][Edit] skip (row not cached)', 'mid=' + message.id);
     return;
   }
 
-  const editedAt = message.editedAt
-    ? message.editedAt.toISOString()
-    : new Date().toISOString();
+  const parsed = parseLeaveForm(message.content);
+  if (!parsed) {
+    console.log('[Leave][Edit] skip (format not matched)', 'mid=' + message.id);
+    return;
+  }
 
-  const content = message.content ? String(message.content) : '';
+  // 등록시간(D)은 최초 작성 시간으로 유지, A~C만 업데이트
+  const range = a1Range(SHEET_TITLE, 'A' + rowNum + ':C' + rowNum);
 
   console.log(
-    '[Sheets][Edit] try',
+    '[Leave][Edit] try',
     'mid=' + message.id,
-    'row=' + rowNum,
-    'content=' + safeShort(content, 60)
+    'row=' + rowNum
   );
 
-  const data = [
-    { range: SHEET_TITLE + '!B' + rowNum + ':B' + rowNum, values: [[editedAt]] }, // edited_at
-    { range: SHEET_TITLE + '!G' + rowNum + ':G' + rowNum, values: [[content]] },  // content
-  ];
-
-  await sheetsApi.spreadsheets.values.batchUpdate({
+  await sheetsApi.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
+    range: range,
+    valueInputOption: 'RAW',
     requestBody: {
-      valueInputOption: 'RAW',
-      data: data,
+      values: [[parsed.nickname, parsed.reason, parsed.period]],
     },
   });
 
-  console.log('[Sheets][Edit] ok', 'mid=' + message.id, 'row=' + rowNum);
+  console.log('[Leave][Edit] ok', 'mid=' + message.id, 'row=' + rowNum);
 }
 
 // ---- Global Error Logs (Heroku logs에 반드시 찍히게) ----
@@ -256,7 +253,6 @@ client.on('ready', async () => {
   console.log('[Bot] LoggedInAs:', client.user.tag);
   console.log('[Bot] TARGET_CHANNEL_ID:', TARGET_CHANNEL_ID);
 
-  // env 존재 여부 로그(값 자체는 찍지 않음)
   console.log('[Env] DISCORD_TOKEN:', process.env.DISCORD_TOKEN ? 'SET' : 'MISSING');
   console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
 
@@ -267,23 +263,22 @@ client.on('ready', async () => {
   }
 });
 
-// 메시지 작성 시 시트 append + 기존 명령 유지
+// 메시지 작성 시: 타겟 채널(또는 스레드) + 양식이면 시트에 기록
 client.on('message', async (message) => {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
-  // 디버그 로그: 메시지 이벤트가 실제 들어오는지
-  // 타겟 채널(또는 그 스레드)만 로그 찍게 제한
   if (isTargetChannelOrThread(message)) {
     console.log(
       '[MSG] recv',
       'cid=' + message.channel.id,
       'parent=' + (message.channel.parentID ? message.channel.parentID : 'none'),
       'mid=' + message.id,
-      'content=' + safeShort(message.content, 80)
+      'created(KST)=' + formatKSTFromDate(message.createdAt),
+      'content=' + safeShort(message.content, 140)
     );
 
-    enqueueSheetJob(() => appendMessageToSheet(message));
+    enqueueSheetJob(() => appendLeaveRow(message));
   }
 
   // Commands
@@ -302,7 +297,6 @@ client.on('message', async (message) => {
 
     const SPECTATOR_TAG = /\[관전\]/i;
 
-    // 봇, 관전 태그만 제외 (마이크 mute 조건 제거)
     const members = voiceChannel.members
       .filter(m => {
         const name = m.displayName || m.user.username || '';
@@ -347,7 +341,6 @@ client.on('message', async (message) => {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
     }
 
-    // 순서대로 내전1부터 10까지 임
     const voiceChannelIds = [
       '1450857003521015921', '1450857559715217560', '1450857466312261786',
       '1450857664388005980', '1450857791789989971', '1450857978289983568',
@@ -384,7 +377,6 @@ client.on('message', async (message) => {
 
     const voice = message.member.voice.channel;
 
-    // 닉네임/서버닉네임에 [관전] 포함된 멤버 제거, 봇도 제외
     const SPECTATOR_TAG = /\[관전\]/i;
     const effectiveMembers = voice.members.filter(m => {
       const name = m.displayName || m.user.username || '';
@@ -394,10 +386,7 @@ client.on('message', async (message) => {
     const currentMembers = effectiveMembers.size;
     const remainingMembers = Math.max(maxMembers - currentMembers, 0);
 
-    // 초대 링크 생성 (1시간)
-    const invite = await voice.createInvite({
-      maxAge: 3600
-    });
+    const invite = await voice.createInvite({ maxAge: 3600 });
 
     const colors = ['#FF5733', '#C70039', '#900C3F', '#581845', '#2E86C1', '#2ECC71', '#F1C40F', '#8E44AD'];
     const selectedColor = colors[Math.floor(Math.random() * colors.length)];
@@ -423,19 +412,16 @@ client.on('message', async (message) => {
   }
 });
 
-// 메시지 수정 시 edited_at + content 업데이트
+// 메시지 수정 시: (캐시에 row가 있는 경우만) A~C 갱신
 client.on('messageUpdate', async (oldMessage, newMessage) => {
   try {
     if (!newMessage) return;
 
-    // partial이면 fetch 시도
     if (newMessage.partial) {
       try { newMessage = await newMessage.fetch(); } catch (e) { return; }
     }
 
     if (!newMessage.author || newMessage.author.bot) return;
-
-    // 타겟 채널/스레드만 처리
     if (!isTargetChannelOrThread(newMessage)) return;
 
     console.log(
@@ -443,10 +429,10 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
       'cid=' + newMessage.channel.id,
       'parent=' + (newMessage.channel.parentID ? newMessage.channel.parentID : 'none'),
       'mid=' + newMessage.id,
-      'content=' + safeShort(newMessage.content, 80)
+      'content=' + safeShort(newMessage.content, 140)
     );
 
-    enqueueSheetJob(() => updateEditedMessageInSheet(newMessage));
+    enqueueSheetJob(() => updateLeaveRowFromEdit(newMessage));
   } catch (e) {
     console.error('[messageUpdate handler error]', e && e.stack ? e.stack : e);
   }
