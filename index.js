@@ -16,7 +16,7 @@ const prefix = '!';
 let latestTeams = []; // !팀 명령으로 구성된 최신 팀 정보를 저장
 
 // ---- Google Sheets Settings ----
-const TARGET_CHANNEL_ID = '1362990551850418316';
+const TARGET_CHANNEL_ID = '1439239707320909895';
 const SPREADSHEET_ID = '1aXIUb5yMA92s5EoYuyxf5IM8yFa_hryihUJDFIjsxyU';
 
 // 여기에 기록할 시트 탭 이름
