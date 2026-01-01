@@ -403,7 +403,7 @@ client.on('message', async (message) => {
     const selectedColor = colors[Math.floor(Math.random() * colors.length)];
 
     const inviteMessage = new Discord.MessageEmbed()
-      .setTitle(`:loud_sound: ${voice.name} 여기 왕따 있어요!!!! \n${remainingMembers} 명 구인 구직 중이에요`)
+      .setTitle(`:loud_sound: ${voice.name} 여기 왕따 있어요!!!!@here \n${remainingMembers} 명 구인 구직 중이에요`)
       .setColor(selectedColor)
       .setFooter('해당링크는 1시간 후 자동으로 소멸됩니다.')
       .setTimestamp();
