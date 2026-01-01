@@ -409,7 +409,7 @@ client.on('message', async (message) => {
       .setTimestamp();
 
     message.channel.send(inviteMessage);
-    message.channel.send(invite.url + "@here");
+    message.channel.send(invite.url + "\n@here");
     return;
   }
 
