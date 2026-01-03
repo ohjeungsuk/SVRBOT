@@ -1,4 +1,4 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger for "카톡외출목록" + !백업)
+// index.js (discord.js v12.5.3 + Google Sheets logger for "카톡외출목록" + !백업 + !듀오)
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
@@ -338,8 +338,7 @@ async function runBackup(invokingMessage) {
 
     await createSheetTab(newTitle);
 
-    // 백업 시트는 3컬럼만
-    // 닉네임 / 사유 / 외출날짜(=기간)
+    // 백업 시트는 3컬럼만: 닉네임 / 사유 / 외출날짜(=기간)
     const header = ['닉네임', '사유', '외출날짜'];
     await appendRowsToSheet(newTitle, [header], 'A:C');
 
@@ -451,7 +450,7 @@ client.on('message', async (message) => {
     return;
   }
 
-  // ---- 기존 기능들 ----
+  // !팀
   if (command === '팀') {
     const n = parseInt(args[0], 10);
     if (isNaN(n) || n < 1) return message.reply('올바른 인원 수를 입력해주세요.');
@@ -498,6 +497,7 @@ client.on('message', async (message) => {
     return;
   }
 
+  // !해산
   if (command === '해산') {
     if (latestTeams.length === 0) {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
@@ -529,6 +529,7 @@ client.on('message', async (message) => {
     return;
   }
 
+  // !놀자 (최대 4명)
   if (command === '놀자') {
     const maxMembers = 4;
 
@@ -563,9 +564,46 @@ client.on('message', async (message) => {
     return;
   }
 
+  // !듀오 (최대 2명) - !놀자와 동일 동작
+  if (command === '듀오') {
+    const maxMembers = 2;
+
+    if (!message.member.voice.channel) {
+      return message.reply('먼저 음성 채널에 들어가주세요!');
+    }
+
+    const voice = message.member.voice.channel;
+
+    const SPECTATOR_TAG = /\[관전\]/i;
+    const effectiveMembers = voice.members.filter(m => {
+      const name = m.displayName || m.user.username || '';
+      return !m.user.bot && !SPECTATOR_TAG.test(name);
+    });
+
+    const currentMembers = effectiveMembers.size;
+    const remainingMembers = Math.max(maxMembers - currentMembers, 0);
+
+    const invite = await voice.createInvite({ maxAge: 3600 });
+
+    const colors = ['#FF5733', '#C70039', '#900C3F', '#581845', '#2E86C1', '#2ECC71', '#F1C40F', '#8E44AD'];
+    const selectedColor = colors[Math.floor(Math.random() * colors.length)];
+
+    const inviteMessage = new Discord.MessageEmbed()
+      .setTitle(`:loud_sound: ${voice.name} 듀오 구인 구직 중이에요 \n${remainingMembers} 명 더 필요해요`)
+      .setColor(selectedColor)
+      .setFooter('해당링크는 1시간 후 자동으로 소멸됩니다.')
+      .setTimestamp();
+
+    message.channel.send(inviteMessage);
+    message.channel.send(invite.url + "\n@here");
+    return;
+  }
+
+  // !명령어
   if (message.content === '!명령어') {
     message.channel.send(
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
+      `**듀오 구인구직 사용방법!**\n음성채널 생성 후 \`\`!듀오\`\` 입력하면 듀오(2인) 초대링크 생성\n\n` +
       `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함] \n 해당 봇 저작권은 도비에게 있습니다. `
     );
     return;
