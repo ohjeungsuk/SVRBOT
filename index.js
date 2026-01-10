@@ -17,7 +17,10 @@ let latestTeams = [];
 
 // ---- Google Sheets Settings ----
 const TARGET_CHANNEL_ID = '1439239707320909895';
-const SPREADSHEET_ID = '1aXIUb5yMA92s5EoYuyxf5IM8yFa_hryihUJDFIjsxyU';
+
+// UPDATED: Spreadsheet ID changed
+// https://docs.google.com/spreadsheets/d/1WzlRm6jlOGxTz4dTgbdMopzcJCNop8dnz7kP9GsMXZs/edit?gid=1324460870#gid=1324460870
+const SPREADSHEET_ID = '1WzlRm6jlOGxTz4dTgbdMopzcJCNop8dnz7kP9GsMXZs';
 
 // 외출 목록 기록 탭(실시간 기록용: 4컬럼)
 const SHEET_TITLE_FIXED = '카톡외출목록';
@@ -139,7 +142,9 @@ async function initSheets() {
 
   sheetsApi = google.sheets({ version: 'v4', auth });
   SHEET_TITLE = SHEET_TITLE_FIXED;
+
   console.log('[Sheets] LeaveSheetTitle(Fixed):', SHEET_TITLE);
+  console.log('[Sheets] SpreadsheetId:', SPREADSHEET_ID);
 }
 
 function extractRowNumberFromUpdatedRange(updatedRange) {
@@ -260,9 +265,7 @@ async function createSheetTab(title) {
     spreadsheetId: SPREADSHEET_ID,
     requestBody: {
       requests: [
-        {
-          addSheet: { properties: { title: title } },
-        },
+        { addSheet: { properties: { title: title } } },
       ],
     },
   });
@@ -300,9 +303,7 @@ async function fetchAllMessagesFromChannelText(channel) {
     if (!batch || batch.size === 0) break;
 
     const arr = batch.array();
-    for (let i = 0; i < arr.length; i++) {
-      all.push(arr[i]);
-    }
+    for (let i = 0; i < arr.length; i++) all.push(arr[i]);
 
     lastId = arr[arr.length - 1].id;
 
@@ -338,7 +339,6 @@ async function runBackup(invokingMessage) {
 
     await createSheetTab(newTitle);
 
-    // 백업 시트는 3컬럼만: 닉네임 / 사유 / 외출날짜(=기간)
     const header = ['닉네임', '사유', '외출날짜'];
     await appendRowsToSheet(newTitle, [header], 'A:C');
 
@@ -350,12 +350,9 @@ async function runBackup(invokingMessage) {
       return;
     }
 
-    // 과거 -> 최신
     msgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
     console.log('[Backup] total messages fetched:', msgs.length);
 
-    // 양식 메시지들만 뽑아서 3컬럼 row로 변환
     const rows = [];
     let matched = 0;
 
@@ -378,7 +375,6 @@ async function runBackup(invokingMessage) {
       return;
     }
 
-    // 500줄씩 append
     const CHUNK = 500;
     for (let s = 0; s < rows.length; s += CHUNK) {
       const chunk = rows.slice(s, s + CHUNK);
@@ -437,20 +433,17 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
-  // Commands
   if (!message.content || !message.content.startsWith(prefix)) return;
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  // !백업: 지정 채널에서 "양식 메시지"만 뽑아서 3컬럼으로 새 시트에 저장
   if (command === '백업') {
     console.log('[Backup] command received by', message.author.tag);
     runBackup(message);
     return;
   }
 
-  // !팀
   if (command === '팀') {
     const n = parseInt(args[0], 10);
     if (isNaN(n) || n < 1) return message.reply('올바른 인원 수를 입력해주세요.');
@@ -497,7 +490,6 @@ client.on('message', async (message) => {
     return;
   }
 
-  // !해산
   if (command === '해산') {
     if (latestTeams.length === 0) {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
@@ -529,7 +521,6 @@ client.on('message', async (message) => {
     return;
   }
 
-  // !놀자 (최대 4명)
   if (command === '놀자') {
     const maxMembers = 4;
 
@@ -564,7 +555,6 @@ client.on('message', async (message) => {
     return;
   }
 
-  // !듀오 (최대 2명) - !놀자와 동일 동작
   if (command === '듀오') {
     const maxMembers = 2;
 
@@ -599,7 +589,6 @@ client.on('message', async (message) => {
     return;
   }
 
-  // !명령어
   if (message.content === '!명령어') {
     message.channel.send(
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
