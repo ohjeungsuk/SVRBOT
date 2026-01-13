@@ -1,8 +1,14 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger for "카톡외출목록" + !백업 + !듀오 + Groq AI chat)
+// index.js (discord.js v12.5.3 + Google Sheets logger + GPT API via OpenAI Responses)
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
-// - GROQ_API_KEY
+// - OPENAI_API_KEY
+// Optional:
+// - OPENAI_MODEL (default: gpt-4o-mini)
+// - OPENAI_MAX_TOKENS (default: 160)
+// - OPENAI_TIMEOUT_MS (default: 25000)
+//
+// Recommended Heroku dynos: worker=1, web=0
 
 const Discord = require('discord.js');
 const { google } = require('googleapis');
@@ -15,38 +21,22 @@ const client = new Discord.Client({
 const prefix = '!';
 let latestTeams = [];
 
-// ---- AI (Groq) Settings ----
-const AI_DISABLED_MESSAGE = '현재 작동이 불가능 합니다';
-const AI_NOT_OWNER_MESSAGE = '당신은 내 주인이 아냐 돌아가';
+// ---- OpenAI Settings ----
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || '160', 10);
+const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '25000', 10);
 
-const AI_MAX_INPUT_CHARS = 600;
-const AI_MAX_TOKENS = 256;
-const AI_USER_COOLDOWN_MS = 8000;
-const AI_TIMEOUT_MS = 20000;
-const AI_MODEL = 'llama-3.1-8b-instant';
-
-// 인증된 AI 채널 ID (!인증 명령으로 세팅됨)
-// Heroku 재시작/배포 시 초기화됨(메모리 저장)
-let aiChannelId = '';
-
-// 주인 목록 (!주인 @태그 로 등록)
-// Heroku 재시작/배포 시 초기화됨(메모리 저장)
-const aiOwners = new Set();
-
-// 주인 아닌 사람이 말 걸 때 스팸 방지(너무 많이 답장 안 하게)
-const rejectCooldownMs = 5000;
-const rejectLastByUser = new Map();
+// ---- AI Channel 인증 (길드별 1개 채널) ----
+const aiChannelByGuild = new Map(); // guildId -> channelId
+const aiQueueByGuild = new Map();   // guildId -> Promise
+const aiHistoryByChannel = new Map(); // key: guildId:channelId -> [{role, text}]
+const aiCooldownByUser = new Map(); // userId -> lastTimestamp(ms)
 
 // ---- Google Sheets Settings ----
 const TARGET_CHANNEL_ID = '1439239707320909895';
-
-// UPDATED: Spreadsheet ID changed
 const SPREADSHEET_ID = '1WzlRm6jlOGxTz4dTgbdMopzcJCNop8dnz7kP9GsMXZs';
-
-// 외출 목록 기록 탭(실시간 기록용: 4컬럼)
 const SHEET_TITLE_FIXED = '카톡외출목록';
-
-// 백업 최대 메시지 수(안전장치)
 const BACKUP_MAX_MESSAGES = 20000;
 
 // sheet job serialize
@@ -58,15 +48,19 @@ function enqueueSheetJob(fn) {
   return sheetQueue;
 }
 
+function enqueueAiJob(guildId, fn) {
+  const prev = aiQueueByGuild.get(guildId) || Promise.resolve();
+  const next = prev.then(fn).catch((err) => {
+    console.error('[AIJobError]', err && err.stack ? err.stack : err);
+  });
+  aiQueueByGuild.set(guildId, next);
+  return next;
+}
+
 function getEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error('Missing env var: ' + name);
   return v;
-}
-
-function getEnvOptional(name) {
-  const v = process.env[name];
-  return v ? String(v) : '';
 }
 
 function safeShort(str, maxLen) {
@@ -149,8 +143,6 @@ function parseLeaveForm(content) {
 
 let sheetsApi = null;
 let SHEET_TITLE = null;
-
-// message_id -> row number cache (실시간 기록용)
 const msgRowCache = new Map();
 
 async function initSheets() {
@@ -178,7 +170,6 @@ function extractRowNumberFromUpdatedRange(updatedRange) {
   return isNaN(n) ? null : n;
 }
 
-// 실시간 외출목록: 4컬럼 (닉네임/사유/기간/등록시간)
 async function appendLeaveRow(message) {
   await initSheets();
 
@@ -210,7 +201,6 @@ async function appendLeaveRow(message) {
   console.log('[Leave][Append] ok', 'mid=' + message.id, 'row=' + (rowNum ? rowNum : 'unknown'));
 }
 
-// 메시지 수정 시(캐시에 row가 있는 경우만) A~C 업데이트
 async function updateLeaveRowFromEdit(message) {
   await initSheets();
 
@@ -240,7 +230,7 @@ async function updateLeaveRowFromEdit(message) {
   console.log('[Leave][Edit] ok', 'mid=' + message.id, 'row=' + rowNum);
 }
 
-// ---------- Backup 기능 (3컬럼만 저장) ----------
+// ---------- Backup 기능 ----------
 let backupRunning = false;
 
 async function getOrFetchChannel(channelId) {
@@ -418,191 +408,247 @@ async function runBackup(invokingMessage) {
   }
 }
 
-// ---- AI (Groq) Helpers ----
-const aiLastCallByUser = new Map();
-const aiInFlightByUser = new Map();
+// ---- OpenAI (Responses API) ----
+function extractResponseText(respJson) {
+  if (!respJson) return '';
+  if (respJson.output && Array.isArray(respJson.output)) {
+    let out = '';
+    for (let i = 0; i < respJson.output.length; i++) {
+      const item = respJson.output[i];
+      if (!item || item.type !== 'message' || item.role !== 'assistant') continue;
+      const content = item.content;
+      if (!content || !Array.isArray(content)) continue;
+
+      for (let j = 0; j < content.length; j++) {
+        const c = content[j];
+        if (!c) continue;
+        if (c.type === 'output_text' && typeof c.text === 'string') out += c.text;
+      }
+    }
+    return String(out || '').trim();
+  }
+  return '';
+}
+
+function callOpenAIResponses(instructions, inputText) {
+  return new Promise((resolve) => {
+    if (!OPENAI_API_KEY) {
+      resolve({ ok: false, errorType: 'missing_key', text: '' });
+      return;
+    }
+
+    const bodyObj = {
+      model: OPENAI_MODEL,
+      instructions: instructions,
+      input: inputText,
+      max_output_tokens: isNaN(OPENAI_MAX_TOKENS) ? 160 : OPENAI_MAX_TOKENS,
+      temperature: 0.8,
+      store: false,
+      text: { format: { type: 'text' } },
+    };
+
+    const body = JSON.stringify(bodyObj);
+
+    const req = https.request(
+      {
+        hostname: 'api.openai.com',
+        path: '/v1/responses',
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + OPENAI_API_KEY,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: OPENAI_TIMEOUT_MS,
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          let json = null;
+          try { json = JSON.parse(data); } catch (e) { json = null; }
+
+          if (!res || res.statusCode < 200 || res.statusCode >= 300) {
+            const code = json && json.error && json.error.code ? String(json.error.code) : '';
+            const msg = json && json.error && json.error.message ? String(json.error.message) : ('HTTP ' + res.statusCode);
+            const status = res ? res.statusCode : 0;
+
+            if (status === 429 || code === 'rate_limit_exceeded' || code === 'insufficient_quota') {
+              resolve({ ok: false, errorType: 'limit', text: '', raw: msg });
+              return;
+            }
+            resolve({ ok: false, errorType: 'http', text: '', raw: msg });
+            return;
+          }
+
+          const text = extractResponseText(json);
+          resolve({ ok: true, text: text, raw: json });
+        });
+      }
+    );
+
+    req.on('timeout', () => {
+      try { req.destroy(new Error('timeout')); } catch (e) {}
+      resolve({ ok: false, errorType: 'timeout', text: '' });
+    });
+
+    req.on('error', (err) => {
+      resolve({ ok: false, errorType: 'network', text: '', raw: err ? err.message : '' });
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
+function getAiChannelId(message) {
+  if (!message || !message.guild) return '';
+  return aiChannelByGuild.get(String(message.guild.id)) || '';
+}
+
+function isAiChannelOrThread(message) {
+  if (!message || !message.guild || !message.channel) return false;
+
+  const aiCid = getAiChannelId(message);
+  if (!aiCid) return false;
+
+  if (String(message.channel.id) === String(aiCid)) return true;
+  if (message.channel.parentID && String(message.channel.parentID) === String(aiCid)) return true;
+  return false;
+}
+
+function getChannelHistoryKey(message) {
+  if (!message || !message.guild || !message.channel) return '';
+  const aiCid = getAiChannelId(message);
+  if (!aiCid) return '';
+  return String(message.guild.id) + ':' + String(aiCid);
+}
+
+function getHistoryFor(message) {
+  const key = getChannelHistoryKey(message);
+  if (!key) return [];
+  const h = aiHistoryByChannel.get(key);
+  if (h && Array.isArray(h)) return h;
+  return [];
+}
+
+function setHistoryFor(message, history) {
+  const key = getChannelHistoryKey(message);
+  if (!key) return;
+  aiHistoryByChannel.set(key, history);
+}
+
+function trimHistory(history) {
+  if (!history || !Array.isArray(history)) return [];
+
+  const maxItems = 12;
+  let h = history.slice(-maxItems);
+
+  // 너무 길면 문자수 기준으로도 자름
+  let total = 0;
+  for (let i = h.length - 1; i >= 0; i--) {
+    total += String(h[i].text || '').length;
+    if (total > 2500) {
+      h = h.slice(i + 1);
+      break;
+    }
+  }
+  return h;
+}
+
+async function sendLongText(channel, text) {
+  if (!channel) return;
+  const s = String(text || '').trim();
+  if (!s) {
+    await channel.send('현재 작동이 불가능 합니다');
+    return;
+  }
+
+  const LIMIT = 1900;
+  if (s.length <= LIMIT) {
+    await channel.send(s);
+    return;
+  }
+
+  let idx = 0;
+  while (idx < s.length) {
+    const chunk = s.slice(idx, idx + LIMIT);
+    idx += LIMIT;
+    await channel.send(chunk);
+  }
+}
 
 function nowMs() {
   return new Date().getTime();
 }
 
-function clampPrompt(text) {
-  const s = String(text || '').trim();
-  if (!s) return '';
-  if (s.length <= AI_MAX_INPUT_CHARS) return s;
-  return s.slice(0, AI_MAX_INPUT_CHARS);
-}
-
-function splitDiscordMessage(text, maxLen) {
-  const s = String(text || '');
-  const out = [];
-  let i = 0;
-  while (i < s.length) {
-    out.push(s.slice(i, i + maxLen));
-    i += maxLen;
-  }
-  return out;
-}
-
-async function sendLongText(channel, text) {
-  const chunks = splitDiscordMessage(text, 1900);
-  for (let i = 0; i < chunks.length; i++) {
-    await channel.send(chunks[i]);
-  }
-}
-
-function groqRequestJson(payloadObj) {
-  return new Promise((resolve, reject) => {
-    const apiKey = getEnvOptional('GROQ_API_KEY');
-    if (!apiKey) {
-      const e = new Error('GROQ_API_KEY missing');
-      e.statusCode = 0;
-      return reject(e);
-    }
-
-    const payload = JSON.stringify(payloadObj);
-    const options = {
-      hostname: 'api.groq.com',
-      path: '/openai/v1/chat/completions',
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + apiKey,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        const code = res.statusCode || 0;
-        if (code < 200 || code >= 300) {
-          const e = new Error('Groq HTTP ' + code);
-          e.statusCode = code;
-          e.body = data;
-          return reject(e);
-        }
-
-        try {
-          const json = JSON.parse(data);
-          resolve(json);
-        } catch (e) {
-          e.statusCode = code;
-          e.body = data;
-          reject(e);
-        }
-      });
-    });
-
-    req.on('error', (err) => {
-      reject(err);
-    });
-
-    req.setTimeout(AI_TIMEOUT_MS, () => {
-      try { req.destroy(new Error('timeout')); } catch (e) {}
-    });
-
-    req.write(payload);
-    req.end();
-  });
-}
-
-async function callGroqChat(prompt) {
-  const p = clampPrompt(prompt);
-  if (!p) return '';
-
-  const payload = {
-    model: AI_MODEL,
-    messages: [
-      { role: 'system', content: '너는 디스코드 채팅용 AI다. 한국어로 짧고 자연스럽게 답해라. 필요 이상으로 길게 말하지 마라.' },
-      { role: 'user', content: p },
-    ],
-    temperature: 0.8,
-    max_tokens: AI_MAX_TOKENS,
-  };
-
-  const json = await groqRequestJson(payload);
-
-  const out =
-    json &&
-    json.choices &&
-    json.choices[0] &&
-    json.choices[0].message &&
-    typeof json.choices[0].message.content === 'string'
-      ? json.choices[0].message.content
-      : '';
-
-  return String(out || '').trim();
-}
-
-function isAiOwner(userId) {
-  return aiOwners.has(String(userId));
-}
-
-function shouldBlockAiForUser(userId) {
-  const t = aiLastCallByUser.get(String(userId));
-  if (!t) return false;
-  return (nowMs() - t) < AI_USER_COOLDOWN_MS;
-}
-
-function markAiCall(userId) {
-  aiLastCallByUser.set(String(userId), nowMs());
-}
-
-function isAiChannelOrThread(message) {
-  if (!aiChannelId) return false;
-  if (!message || !message.channel) return false;
-
-  // 인증된 채널 자체
-  if (String(message.channel.id) === String(aiChannelId)) return true;
-
-  // 스레드라면 parentID가 인증 채널이면 허용
-  if (message.channel.parentID && String(message.channel.parentID) === String(aiChannelId)) return true;
-
+function isOnCooldown(userId) {
+  const last = aiCooldownByUser.get(String(userId)) || 0;
+  const t = nowMs();
+  if (t - last < 2000) return true;
+  aiCooldownByUser.set(String(userId), t);
   return false;
 }
 
-function canManageAi(message) {
-  if (!message || !message.guild || !message.member) return false;
-  // 서버 오너 또는 관리자만
-  const isGuildOwner = message.guild.ownerID && String(message.guild.ownerID) === String(message.author.id);
-  const isAdmin = message.member.hasPermission && message.member.hasPermission('ADMINISTRATOR');
-  return !!(isGuildOwner || isAdmin);
-}
+async function handleAiChat(message) {
+  if (!message || !message.guild) return;
+  if (!isAiChannelOrThread(message)) return;
+  if (!message.content) return;
 
-function canRejectNow(userId) {
-  const last = rejectLastByUser.get(String(userId));
-  if (!last) return true;
-  return (nowMs() - last) >= rejectCooldownMs;
-}
+  // 명령어는 기존 로직이 처리하도록 AI는 무시
+  if (message.content.startsWith(prefix)) return;
 
-function markReject(userId) {
-  rejectLastByUser.set(String(userId), nowMs());
-}
+  // 외출양식 메시지는 AI가 끼지 않게 차단
+  if (parseLeaveForm(message.content)) return;
 
-async function handleAiMessage(message, promptText) {
-  try {
-    if (shouldBlockAiForUser(message.author.id)) return;
+  if (isOnCooldown(message.author.id)) return;
 
-    if (aiInFlightByUser.get(String(message.author.id))) return;
-    aiInFlightByUser.set(String(message.author.id), true);
+  const raw = String(message.content).trim();
+  if (!raw) return;
 
-    markAiCall(message.author.id);
+  const history = trimHistory(getHistoryFor(message));
 
-    const answer = await callGroqChat(promptText);
-    if (!answer) {
-      await message.channel.send(AI_DISABLED_MESSAGE);
+  const instructionText =
+    '너는 디스코드 채팅용 간단한 대화 봇이다. ' +
+    '대답은 짧고 자연스럽게 한다. ' +
+    '과한 설명은 하지 않는다. ' +
+    '모르는 내용은 모른다고 말한다.';
+
+  // 대화 프롬프트 구성
+  let prompt = '';
+  for (let i = 0; i < history.length; i++) {
+    const it = history[i];
+    if (!it || !it.role) continue;
+    const role = it.role === 'user' ? 'User' : 'Assistant';
+    prompt += role + ': ' + String(it.text || '') + '\n';
+  }
+  prompt += 'User: ' + raw + '\nAssistant:';
+
+  // 입력 저장
+  history.push({ role: 'user', text: raw });
+  setHistoryFor(message, trimHistory(history));
+
+  // 호출
+  const result = await callOpenAIResponses(instructionText, prompt);
+
+  if (!result.ok) {
+    if (result.errorType === 'limit' || result.errorType === 'missing_key') {
+      await message.channel.send('현재 작동이 불가능 합니다');
       return;
     }
-
-    await sendLongText(message.channel, answer);
-  } catch (e) {
-    console.error('[AI] failed:', e && e.stack ? e.stack : e);
-    try { await message.channel.send(AI_DISABLED_MESSAGE); } catch (ee) {}
-  } finally {
-    aiInFlightByUser.set(String(message.author.id), false);
+    await message.channel.send('현재 작동이 불가능 합니다');
+    return;
   }
+
+  let out = String(result.text || '').trim();
+  if (!out) out = '현재 작동이 불가능 합니다';
+
+  // 출력 저장
+  const h2 = getHistoryFor(message);
+  h2.push({ role: 'assistant', text: out });
+  setHistoryFor(message, trimHistory(h2));
+
+  await sendLongText(message.channel, out);
 }
 
 // ---- Global Error Logs ----
@@ -619,7 +665,8 @@ client.on('ready', async () => {
   console.log('[Bot] TARGET_CHANNEL_ID:', TARGET_CHANNEL_ID);
   console.log('[Env] DISCORD_TOKEN:', process.env.DISCORD_TOKEN ? 'SET' : 'MISSING');
   console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
-  console.log('[Env] GROQ_API_KEY:', process.env.GROQ_API_KEY ? 'SET' : 'MISSING');
+  console.log('[Env] OPENAI_API_KEY:', OPENAI_API_KEY ? 'SET' : 'MISSING');
+  console.log('[Env] OPENAI_MODEL:', OPENAI_MODEL);
 
   try {
     await initSheets();
@@ -633,7 +680,7 @@ client.on('message', async (message) => {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
-  // 외출목록 기록
+  // 기존: 타겟 채널 양식 기록
   if (isTargetChannelOrThread(message)) {
     console.log(
       '[MSG] recv',
@@ -645,87 +692,28 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
-  // 인증된 AI 채널에서 "명령어 없이" 채팅하면 AI 응답 (주인만)
-  if (isAiChannelOrThread(message)) {
-    if (message.content && !message.content.startsWith(prefix)) {
-      if (!isAiOwner(message.author.id)) {
-        if (canRejectNow(message.author.id)) {
-          markReject(message.author.id);
-          try { await message.channel.send(AI_NOT_OWNER_MESSAGE); } catch (e) {}
-        }
-        return;
-      }
-      await handleAiMessage(message, message.content);
-      return;
-    }
+  // AI 대화: 인증된 채널에서만, 명령어 제외
+  if (message.guild && isAiChannelOrThread(message) && (!message.content || !message.content.startsWith(prefix))) {
+    enqueueAiJob(String(message.guild.id), () => handleAiChat(message));
+    return;
   }
 
-  // 커맨드 처리
+  // 명령어 처리
   if (!message.content || !message.content.startsWith(prefix)) return;
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  // AI 채널 인증: 이 명령을 친 채널이 AI 채널이 됨
+  // AI 채널 인증
   if (command === '인증') {
-    if (!canManageAi(message)) {
+    if (!message.guild) return;
+    if (!message.member || !message.member.hasPermission('ADMINISTRATOR')) {
       try { await message.reply('권한이 없다.'); } catch (e) {}
       return;
     }
-
-    // 스레드에서 실행하면 부모 채널을 인증 대상으로 잡음
-    const targetId = message.channel.parentID ? String(message.channel.parentID) : String(message.channel.id);
-    aiChannelId = targetId;
-
-    try { await message.reply('AI 채널 인증 완료.'); } catch (e) {}
-    return;
-  }
-
-  // 주인 등록: !주인 @태그
-  if (command === '주인') {
-    if (!canManageAi(message)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
-      return;
-    }
-
-    const mentions = message.mentions && message.mentions.users ? message.mentions.users : null;
-    const first = mentions && mentions.first ? mentions.first() : null;
-    if (!first) {
-      try { await message.reply('사용법: !주인 @태그'); } catch (e) {}
-      return;
-    }
-
-    aiOwners.add(String(first.id));
-    try { await message.reply('주인 등록 완료.'); } catch (e) {}
-    return;
-  }
-
-  // AI 명령어: !ai 질문
-  if (command === 'ai') {
-    if (!aiChannelId) {
-      try { await message.reply('AI 채널이 아직 인증되지 않았다. 인증할 채널에서 !인증 을 먼저 해라.'); } catch (e) {}
-      return;
-    }
-
-    // 인증된 채널에서만
-    if (!isAiChannelOrThread(message)) {
-      try { await message.reply('AI는 인증된 채널에서만 가능하다.'); } catch (e) {}
-      return;
-    }
-
-    // 주인만
-    if (!isAiOwner(message.author.id)) {
-      try { await message.channel.send(AI_NOT_OWNER_MESSAGE); } catch (e) {}
-      return;
-    }
-
-    const prompt = args.join(' ').trim();
-    if (!prompt) {
-      try { await message.reply('사용법: !ai 질문내용'); } catch (e) {}
-      return;
-    }
-
-    await handleAiMessage(message, prompt);
+    aiChannelByGuild.set(String(message.guild.id), String(message.channel.id));
+    aiHistoryByChannel.set(String(message.guild.id) + ':' + String(message.channel.id), []);
+    try { await message.reply('이 채널이 AI 대화 채널로 설정됐다.'); } catch (e) {}
     return;
   }
 
@@ -836,7 +824,7 @@ client.on('message', async (message) => {
     const selectedColor = colors[Math.floor(Math.random() * colors.length)];
 
     const inviteMessage = new Discord.MessageEmbed()
-      .setTitle(`:loud_sound: ${voice.name} 여기 왕따 있어요!!!! \n${remainingMembers} 명 구인 구직 중이에요`)
+      .setTitle(`${voice.name}\n${remainingMembers} 명 구인 구직 중이에요`)
       .setColor(selectedColor)
       .setFooter('해당링크는 1시간 후 자동으로 소멸됩니다.')
       .setTimestamp();
@@ -870,7 +858,7 @@ client.on('message', async (message) => {
     const selectedColor = colors[Math.floor(Math.random() * colors.length)];
 
     const inviteMessage = new Discord.MessageEmbed()
-      .setTitle(`:loud_sound: ${voice.name} 듀오 구인 구직 중이에요 \n${remainingMembers} 명 더 필요해요`)
+      .setTitle(`${voice.name}\n듀오 구인 구직 중이에요\n${remainingMembers} 명 더 필요해요`)
       .setColor(selectedColor)
       .setFooter('해당링크는 1시간 후 자동으로 소멸됩니다.')
       .setTimestamp();
@@ -884,10 +872,7 @@ client.on('message', async (message) => {
     message.channel.send(
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
       `**듀오 구인구직 사용방법!**\n음성채널 생성 후 \`\`!듀오\`\` 입력하면 듀오(2인) 초대링크 생성\n\n` +
-      `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함]\n\n` +
-      `**AI 사용방법!**\nAI를 쓸 채널에서 관리자(또는 서버 오너)가 \`\`!인증\`\` 실행\n관리자(또는 서버 오너)가 \`\`!주인 @태그\`\` 로 주인 등록\n인증된 채널에서 주인만 일반 채팅 또는 \`\`!ai 질문\`\` 가능\n주인이 아니면: ` + AI_NOT_OWNER_MESSAGE + `\n` +
-      `AI가 막히면: ` + AI_DISABLED_MESSAGE + `\n\n` +
-      `해당 봇 저작권은 도비에게 있습니다. `
+      `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함] \n 해당 봇 저작권은 도비에게 있습니다. `
     );
     return;
   }
