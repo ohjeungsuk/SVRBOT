@@ -1,12 +1,14 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger for "카톡외출목록" + !백업 + !듀오)
+// index.js (discord.js v12.5.3 + Google Sheets logger for "카톡외출목록" + !백업 + !듀오 + Groq AI chat)
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
+// - GROQ_API_KEY   (AI 사용시 필수)
 //
 // Recommended Heroku dynos: worker=1, web=0
 
 const Discord = require('discord.js');
 const { google } = require('googleapis');
+const https = require('https');
 
 const client = new Discord.Client({
   partials: ['MESSAGE', 'CHANNEL', 'REACTION'],
@@ -14,6 +16,26 @@ const client = new Discord.Client({
 
 const prefix = '!';
 let latestTeams = [];
+
+// ---- AI (Groq) Settings ----
+// AI 대화 허용 채널 이름
+const AI_CHANNEL_NAME = '!인증';
+
+// AI가 막히면(무료 리미트, 네트워크, 키 없음 등) 이 문구만 출력
+const AI_DISABLED_MESSAGE = '현재 작동이 불가능 합니다';
+
+// 너무 길게 보내면 비용/리미트 금방 닳아서 제한
+const AI_MAX_INPUT_CHARS = 600;
+const AI_MAX_TOKENS = 256;
+
+// 스팸 방지(유저별 쿨타임)
+const AI_USER_COOLDOWN_MS = 8000;
+
+// 요청 타임아웃
+const AI_TIMEOUT_MS = 20000;
+
+// 모델 (가벼운 모델)
+const AI_MODEL = 'llama-3.1-8b-instant';
 
 // ---- Google Sheets Settings ----
 const TARGET_CHANNEL_ID = '1439239707320909895';
@@ -41,6 +63,11 @@ function getEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error('Missing env var: ' + name);
   return v;
+}
+
+function getEnvOptional(name) {
+  const v = process.env[name];
+  return v ? String(v) : '';
 }
 
 function safeShort(str, maxLen) {
@@ -83,6 +110,27 @@ function isTargetChannelOrThread(message) {
   if (message.channel.parentID && String(message.channel.parentID) === TARGET_CHANNEL_ID) {
     return true;
   }
+  return false;
+}
+
+// AI 채널(또는 스레드) 체크
+function isAIChannelOrThread(message) {
+  if (!message || !message.channel) return false;
+
+  // 일반 텍스트 채널
+  if (message.channel.type === 'text') {
+    return String(message.channel.name) === AI_CHANNEL_NAME;
+  }
+
+  // 스레드라면 부모 채널 이름 검사
+  if (message.channel.parentID && message.guild && message.guild.channels) {
+    const parent = message.guild.channels.cache.get(message.channel.parentID);
+    if (parent && parent.name && String(parent.name) === AI_CHANNEL_NAME) return true;
+  }
+
+  // 혹시 channel.name이 있는 타입이면 이름으로도 검사
+  if (message.channel.name && String(message.channel.name) === AI_CHANNEL_NAME) return true;
+
   return false;
 }
 
@@ -395,6 +443,162 @@ async function runBackup(invokingMessage) {
   }
 }
 
+// ---- AI (Groq) Helpers ----
+const aiLastCallByUser = new Map();
+const aiInFlightByUser = new Map();
+
+function nowMs() {
+  return new Date().getTime();
+}
+
+function clampPrompt(text) {
+  const s = String(text || '').trim();
+  if (!s) return '';
+  if (s.length <= AI_MAX_INPUT_CHARS) return s;
+  return s.slice(0, AI_MAX_INPUT_CHARS);
+}
+
+function splitDiscordMessage(text, maxLen) {
+  const s = String(text || '');
+  const out = [];
+  let i = 0;
+  while (i < s.length) {
+    out.push(s.slice(i, i + maxLen));
+    i += maxLen;
+  }
+  return out;
+}
+
+async function sendLongText(channel, text) {
+  const chunks = splitDiscordMessage(text, 1900);
+  for (let i = 0; i < chunks.length; i++) {
+    await channel.send(chunks[i]);
+  }
+}
+
+function groqRequestJson(payloadObj) {
+  return new Promise((resolve, reject) => {
+    const apiKey = getEnvOptional('GROQ_API_KEY');
+    if (!apiKey) {
+      const e = new Error('GROQ_API_KEY missing');
+      e.statusCode = 0;
+      return reject(e);
+    }
+
+    const payload = JSON.stringify(payloadObj);
+    const options = {
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        const code = res.statusCode || 0;
+        if (code < 200 || code >= 300) {
+          const e = new Error('Groq HTTP ' + code);
+          e.statusCode = code;
+          e.body = data;
+          return reject(e);
+        }
+
+        try {
+          const json = JSON.parse(data);
+          resolve(json);
+        } catch (e) {
+          e.statusCode = code;
+          e.body = data;
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    req.setTimeout(AI_TIMEOUT_MS, () => {
+      try { req.destroy(new Error('timeout')); } catch (e) {}
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+async function callGroqChat(prompt) {
+  const p = clampPrompt(prompt);
+  if (!p) return '';
+
+  const payload = {
+    model: AI_MODEL,
+    messages: [
+      { role: 'system', content: '너는 디스코드 채팅용 AI다. 한국어로 짧고 자연스럽게 답해라. 필요 이상으로 길게 말하지 마라.' },
+      { role: 'user', content: p },
+    ],
+    temperature: 0.8,
+    max_tokens: AI_MAX_TOKENS,
+  };
+
+  const json = await groqRequestJson(payload);
+
+  const out =
+    json &&
+    json.choices &&
+    json.choices[0] &&
+    json.choices[0].message &&
+    typeof json.choices[0].message.content === 'string'
+      ? json.choices[0].message.content
+      : '';
+
+  return String(out || '').trim();
+}
+
+function shouldBlockAiForUser(userId) {
+  const t = aiLastCallByUser.get(String(userId));
+  if (!t) return false;
+  return (nowMs() - t) < AI_USER_COOLDOWN_MS;
+}
+
+function markAiCall(userId) {
+  aiLastCallByUser.set(String(userId), nowMs());
+}
+
+async function handleAiMessage(message, promptText) {
+  try {
+    // 쿨타임
+    if (shouldBlockAiForUser(message.author.id)) return;
+
+    // 동시 요청 방지
+    if (aiInFlightByUser.get(String(message.author.id))) return;
+    aiInFlightByUser.set(String(message.author.id), true);
+
+    markAiCall(message.author.id);
+
+    const answer = await callGroqChat(promptText);
+    if (!answer) {
+      await message.channel.send(AI_DISABLED_MESSAGE);
+      return;
+    }
+
+    await sendLongText(message.channel, answer);
+  } catch (e) {
+    // 무료 리미트/인증 실패/네트워크 오류 등 전부 동일 문구
+    // statusCode 429면 레이트리밋 가능성이 큼
+    console.error('[AI] failed:', e && e.stack ? e.stack : e);
+    try { await message.channel.send(AI_DISABLED_MESSAGE); } catch (ee) {}
+  } finally {
+    aiInFlightByUser.set(String(message.author.id), false);
+  }
+}
+
 // ---- Global Error Logs ----
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err && err.stack ? err.stack : err);
@@ -407,8 +611,10 @@ process.on('unhandledRejection', (err) => {
 client.on('ready', async () => {
   console.log('[Bot] LoggedInAs:', client.user.tag);
   console.log('[Bot] TARGET_CHANNEL_ID:', TARGET_CHANNEL_ID);
+  console.log('[Bot] AI_CHANNEL_NAME:', AI_CHANNEL_NAME);
   console.log('[Env] DISCORD_TOKEN:', process.env.DISCORD_TOKEN ? 'SET' : 'MISSING');
   console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
+  console.log('[Env] GROQ_API_KEY:', process.env.GROQ_API_KEY ? 'SET' : 'MISSING');
 
   try {
     await initSheets();
@@ -422,6 +628,7 @@ client.on('message', async (message) => {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
+  // 외출목록 기록
   if (isTargetChannelOrThread(message)) {
     console.log(
       '[MSG] recv',
@@ -433,10 +640,39 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
+  // AI 채널에서는 "명령어 없이" 대화도 가능
+  if (isAIChannelOrThread(message)) {
+    // 명령어(!로 시작)면 아래 커맨드 로직으로 내려가고,
+    // 일반 채팅이면 그대로 AI에게 전달
+    if (message.content && !message.content.startsWith(prefix)) {
+      await handleAiMessage(message, message.content);
+      return;
+    }
+  }
+
+  // 커맨드 처리
   if (!message.content || !message.content.startsWith(prefix)) return;
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
+
+  // AI 커맨드: !ai 질문
+  if (command === 'ai') {
+    // AI는 !인증 채널에서만
+    if (!isAIChannelOrThread(message)) {
+      try { await message.reply('AI 대화는 ' + AI_CHANNEL_NAME + ' 채널에서만 가능하다.'); } catch (e) {}
+      return;
+    }
+
+    const prompt = args.join(' ').trim();
+    if (!prompt) {
+      try { await message.reply('사용법: !ai 질문내용'); } catch (e) {}
+      return;
+    }
+
+    await handleAiMessage(message, prompt);
+    return;
+  }
 
   if (command === '백업') {
     console.log('[Backup] command received by', message.author.tag);
@@ -593,7 +829,9 @@ client.on('message', async (message) => {
     message.channel.send(
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
       `**듀오 구인구직 사용방법!**\n음성채널 생성 후 \`\`!듀오\`\` 입력하면 듀오(2인) 초대링크 생성\n\n` +
-      `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함] \n 해당 봇 저작권은 도비에게 있습니다. `
+      `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함]\n\n` +
+      `**AI 사용방법!**\n${AI_CHANNEL_NAME} 채널에서 그냥 채팅하면 AI가 답합니다.\n또는 ${AI_CHANNEL_NAME} 채널에서 \`\`!ai 질문\`\` 으로도 가능.\n\n` +
+      `해당 봇 저작권은 도비에게 있습니다. `
     );
     return;
   }
