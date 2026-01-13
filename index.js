@@ -2,9 +2,7 @@
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
-// - GROQ_API_KEY   (AI 사용시 필수)
-//
-// Recommended Heroku dynos: worker=1, web=0
+// - GROQ_API_KEY
 
 const Discord = require('discord.js');
 const { google } = require('googleapis');
@@ -18,30 +16,31 @@ const prefix = '!';
 let latestTeams = [];
 
 // ---- AI (Groq) Settings ----
-// AI 대화 허용 채널 이름
-const AI_CHANNEL_NAME = '!인증';
-
-// AI가 막히면(무료 리미트, 네트워크, 키 없음 등) 이 문구만 출력
 const AI_DISABLED_MESSAGE = '현재 작동이 불가능 합니다';
+const AI_NOT_OWNER_MESSAGE = '당신은 내 주인이 아냐 돌아가';
 
-// 너무 길게 보내면 비용/리미트 금방 닳아서 제한
 const AI_MAX_INPUT_CHARS = 600;
 const AI_MAX_TOKENS = 256;
-
-// 스팸 방지(유저별 쿨타임)
 const AI_USER_COOLDOWN_MS = 8000;
-
-// 요청 타임아웃
 const AI_TIMEOUT_MS = 20000;
-
-// 모델 (가벼운 모델)
 const AI_MODEL = 'llama-3.1-8b-instant';
+
+// 인증된 AI 채널 ID (!인증 명령으로 세팅됨)
+// Heroku 재시작/배포 시 초기화됨(메모리 저장)
+let aiChannelId = '';
+
+// 주인 목록 (!주인 @태그 로 등록)
+// Heroku 재시작/배포 시 초기화됨(메모리 저장)
+const aiOwners = new Set();
+
+// 주인 아닌 사람이 말 걸 때 스팸 방지(너무 많이 답장 안 하게)
+const rejectCooldownMs = 5000;
+const rejectLastByUser = new Map();
 
 // ---- Google Sheets Settings ----
 const TARGET_CHANNEL_ID = '1439239707320909895';
 
 // UPDATED: Spreadsheet ID changed
-// https://docs.google.com/spreadsheets/d/1WzlRm6jlOGxTz4dTgbdMopzcJCNop8dnz7kP9GsMXZs/edit?gid=1324460870#gid=1324460870
 const SPREADSHEET_ID = '1WzlRm6jlOGxTz4dTgbdMopzcJCNop8dnz7kP9GsMXZs';
 
 // 외출 목록 기록 탭(실시간 기록용: 4컬럼)
@@ -113,36 +112,12 @@ function isTargetChannelOrThread(message) {
   return false;
 }
 
-// AI 채널(또는 스레드) 체크
-function isAIChannelOrThread(message) {
-  if (!message || !message.channel) return false;
-
-  // 일반 텍스트 채널
-  if (message.channel.type === 'text') {
-    return String(message.channel.name) === AI_CHANNEL_NAME;
-  }
-
-  // 스레드라면 부모 채널 이름 검사
-  if (message.channel.parentID && message.guild && message.guild.channels) {
-    const parent = message.guild.channels.cache.get(message.channel.parentID);
-    if (parent && parent.name && String(parent.name) === AI_CHANNEL_NAME) return true;
-  }
-
-  // 혹시 channel.name이 있는 타입이면 이름으로도 검사
-  if (message.channel.name && String(message.channel.name) === AI_CHANNEL_NAME) return true;
-
-  return false;
-}
-
 function a1Range(sheetTitle, a1) {
   const safe = String(sheetTitle).replace(/'/g, "''");
   return "'" + safe + "'!" + a1;
 }
 
 // 입력 양식 파서
-// 닉네임: 도비/98/TEST
-// 사유: 테스트입니다
-// 기간: 언젠간
 function parseLeaveForm(content) {
   if (!content) return null;
 
@@ -561,6 +536,10 @@ async function callGroqChat(prompt) {
   return String(out || '').trim();
 }
 
+function isAiOwner(userId) {
+  return aiOwners.has(String(userId));
+}
+
 function shouldBlockAiForUser(userId) {
   const t = aiLastCallByUser.get(String(userId));
   if (!t) return false;
@@ -571,12 +550,41 @@ function markAiCall(userId) {
   aiLastCallByUser.set(String(userId), nowMs());
 }
 
+function isAiChannelOrThread(message) {
+  if (!aiChannelId) return false;
+  if (!message || !message.channel) return false;
+
+  // 인증된 채널 자체
+  if (String(message.channel.id) === String(aiChannelId)) return true;
+
+  // 스레드라면 parentID가 인증 채널이면 허용
+  if (message.channel.parentID && String(message.channel.parentID) === String(aiChannelId)) return true;
+
+  return false;
+}
+
+function canManageAi(message) {
+  if (!message || !message.guild || !message.member) return false;
+  // 서버 오너 또는 관리자만
+  const isGuildOwner = message.guild.ownerID && String(message.guild.ownerID) === String(message.author.id);
+  const isAdmin = message.member.hasPermission && message.member.hasPermission('ADMINISTRATOR');
+  return !!(isGuildOwner || isAdmin);
+}
+
+function canRejectNow(userId) {
+  const last = rejectLastByUser.get(String(userId));
+  if (!last) return true;
+  return (nowMs() - last) >= rejectCooldownMs;
+}
+
+function markReject(userId) {
+  rejectLastByUser.set(String(userId), nowMs());
+}
+
 async function handleAiMessage(message, promptText) {
   try {
-    // 쿨타임
     if (shouldBlockAiForUser(message.author.id)) return;
 
-    // 동시 요청 방지
     if (aiInFlightByUser.get(String(message.author.id))) return;
     aiInFlightByUser.set(String(message.author.id), true);
 
@@ -590,8 +598,6 @@ async function handleAiMessage(message, promptText) {
 
     await sendLongText(message.channel, answer);
   } catch (e) {
-    // 무료 리미트/인증 실패/네트워크 오류 등 전부 동일 문구
-    // statusCode 429면 레이트리밋 가능성이 큼
     console.error('[AI] failed:', e && e.stack ? e.stack : e);
     try { await message.channel.send(AI_DISABLED_MESSAGE); } catch (ee) {}
   } finally {
@@ -611,7 +617,6 @@ process.on('unhandledRejection', (err) => {
 client.on('ready', async () => {
   console.log('[Bot] LoggedInAs:', client.user.tag);
   console.log('[Bot] TARGET_CHANNEL_ID:', TARGET_CHANNEL_ID);
-  console.log('[Bot] AI_CHANNEL_NAME:', AI_CHANNEL_NAME);
   console.log('[Env] DISCORD_TOKEN:', process.env.DISCORD_TOKEN ? 'SET' : 'MISSING');
   console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
   console.log('[Env] GROQ_API_KEY:', process.env.GROQ_API_KEY ? 'SET' : 'MISSING');
@@ -623,7 +628,7 @@ client.on('ready', async () => {
   }
 });
 
-// 메시지 작성 시: 타겟 채널(또는 스레드) + 양식이면 외출목록 기록
+// 메시지 작성 시
 client.on('message', async (message) => {
   if (!message || !message.author) return;
   if (message.author.bot) return;
@@ -640,11 +645,16 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
-  // AI 채널에서는 "명령어 없이" 대화도 가능
-  if (isAIChannelOrThread(message)) {
-    // 명령어(!로 시작)면 아래 커맨드 로직으로 내려가고,
-    // 일반 채팅이면 그대로 AI에게 전달
+  // 인증된 AI 채널에서 "명령어 없이" 채팅하면 AI 응답 (주인만)
+  if (isAiChannelOrThread(message)) {
     if (message.content && !message.content.startsWith(prefix)) {
+      if (!isAiOwner(message.author.id)) {
+        if (canRejectNow(message.author.id)) {
+          markReject(message.author.id);
+          try { await message.channel.send(AI_NOT_OWNER_MESSAGE); } catch (e) {}
+        }
+        return;
+      }
       await handleAiMessage(message, message.content);
       return;
     }
@@ -656,11 +666,56 @@ client.on('message', async (message) => {
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  // AI 커맨드: !ai 질문
+  // AI 채널 인증: 이 명령을 친 채널이 AI 채널이 됨
+  if (command === '인증') {
+    if (!canManageAi(message)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    // 스레드에서 실행하면 부모 채널을 인증 대상으로 잡음
+    const targetId = message.channel.parentID ? String(message.channel.parentID) : String(message.channel.id);
+    aiChannelId = targetId;
+
+    try { await message.reply('AI 채널 인증 완료.'); } catch (e) {}
+    return;
+  }
+
+  // 주인 등록: !주인 @태그
+  if (command === '주인') {
+    if (!canManageAi(message)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    const mentions = message.mentions && message.mentions.users ? message.mentions.users : null;
+    const first = mentions && mentions.first ? mentions.first() : null;
+    if (!first) {
+      try { await message.reply('사용법: !주인 @태그'); } catch (e) {}
+      return;
+    }
+
+    aiOwners.add(String(first.id));
+    try { await message.reply('주인 등록 완료.'); } catch (e) {}
+    return;
+  }
+
+  // AI 명령어: !ai 질문
   if (command === 'ai') {
-    // AI는 !인증 채널에서만
-    if (!isAIChannelOrThread(message)) {
-      try { await message.reply('AI 대화는 ' + AI_CHANNEL_NAME + ' 채널에서만 가능하다.'); } catch (e) {}
+    if (!aiChannelId) {
+      try { await message.reply('AI 채널이 아직 인증되지 않았다. 인증할 채널에서 !인증 을 먼저 해라.'); } catch (e) {}
+      return;
+    }
+
+    // 인증된 채널에서만
+    if (!isAiChannelOrThread(message)) {
+      try { await message.reply('AI는 인증된 채널에서만 가능하다.'); } catch (e) {}
+      return;
+    }
+
+    // 주인만
+    if (!isAiOwner(message.author.id)) {
+      try { await message.channel.send(AI_NOT_OWNER_MESSAGE); } catch (e) {}
       return;
     }
 
@@ -830,7 +885,8 @@ client.on('message', async (message) => {
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
       `**듀오 구인구직 사용방법!**\n음성채널 생성 후 \`\`!듀오\`\` 입력하면 듀오(2인) 초대링크 생성\n\n` +
       `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함]\n\n` +
-      `**AI 사용방법!**\n${AI_CHANNEL_NAME} 채널에서 그냥 채팅하면 AI가 답합니다.\n또는 ${AI_CHANNEL_NAME} 채널에서 \`\`!ai 질문\`\` 으로도 가능.\n\n` +
+      `**AI 사용방법!**\nAI를 쓸 채널에서 관리자(또는 서버 오너)가 \`\`!인증\`\` 실행\n관리자(또는 서버 오너)가 \`\`!주인 @태그\`\` 로 주인 등록\n인증된 채널에서 주인만 일반 채팅 또는 \`\`!ai 질문\`\` 가능\n주인이 아니면: ` + AI_NOT_OWNER_MESSAGE + `\n` +
+      `AI가 막히면: ` + AI_DISABLED_MESSAGE + `\n\n` +
       `해당 봇 저작권은 도비에게 있습니다. `
     );
     return;
