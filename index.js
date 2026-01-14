@@ -143,7 +143,17 @@ function parseLeaveForm(content) {
 
 let sheetsApi = null;
 let SHEET_TITLE = null;
+
+// 메시지ID->행번호 캐시. 메모리 상한 유지.
 const msgRowCache = new Map();
+const MSG_ROW_CACHE_MAX = 5000;
+function msgRowCacheSet(mid, row) {
+  if (msgRowCache.size >= MSG_ROW_CACHE_MAX) {
+    const it = msgRowCache.keys().next();
+    if (!it.done) msgRowCache.delete(it.value);
+  }
+  msgRowCache.set(String(mid), row);
+}
 
 async function initSheets() {
   if (sheetsApi && SHEET_TITLE) return;
@@ -196,7 +206,7 @@ async function appendLeaveRow(message) {
 
   const updatedRange = res && res.data && res.data.updates ? res.data.updates.updatedRange : null;
   const rowNum = extractRowNumberFromUpdatedRange(updatedRange);
-  if (rowNum) msgRowCache.set(String(message.id), rowNum);
+  if (rowNum) msgRowCacheSet(String(message.id), rowNum);
 
   console.log('[Leave][Append] ok', 'mid=' + message.id, 'row=' + (rowNum ? rowNum : 'unknown'));
 }
@@ -544,7 +554,6 @@ function trimHistory(history) {
   const maxItems = 12;
   let h = history.slice(-maxItems);
 
-  // 너무 길면 문자수 기준으로도 자름
   let total = 0;
   for (let i = h.length - 1; i >= 0; i--) {
     total += String(h[i].text || '').length;
@@ -595,12 +604,8 @@ async function handleAiChat(message) {
   if (!isAiChannelOrThread(message)) return;
   if (!message.content) return;
 
-  // 명령어는 기존 로직이 처리하도록 AI는 무시
   if (message.content.startsWith(prefix)) return;
-
-  // 외출양식 메시지는 AI가 끼지 않게 차단
   if (parseLeaveForm(message.content)) return;
-
   if (isOnCooldown(message.author.id)) return;
 
   const raw = String(message.content).trim();
@@ -614,7 +619,6 @@ async function handleAiChat(message) {
     '과한 설명은 하지 않는다. ' +
     '모르는 내용은 모른다고 말한다.';
 
-  // 대화 프롬프트 구성
   let prompt = '';
   for (let i = 0; i < history.length; i++) {
     const it = history[i];
@@ -624,11 +628,9 @@ async function handleAiChat(message) {
   }
   prompt += 'User: ' + raw + '\nAssistant:';
 
-  // 입력 저장
   history.push({ role: 'user', text: raw });
   setHistoryFor(message, trimHistory(history));
 
-  // 호출
   const result = await callOpenAIResponses(instructionText, prompt);
 
   if (!result.ok) {
@@ -643,7 +645,6 @@ async function handleAiChat(message) {
   let out = String(result.text || '').trim();
   if (!out) out = '현재 작동이 불가능 합니다';
 
-  // 출력 저장
   const h2 = getHistoryFor(message);
   h2.push({ role: 'assistant', text: out });
   setHistoryFor(message, trimHistory(h2));
@@ -651,13 +652,41 @@ async function handleAiChat(message) {
   await sendLongText(message.channel, out);
 }
 
-// ---- Global Error Logs ----
+// ---- Global Error/Signal Handling ----
+// 치명 예외는 명확 종료하여 Heroku가 즉시 재시작하도록 함.
 process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+  console.error('[FATAL][uncaughtException]', err && err.stack ? err.stack : err);
+  try { if (client && client.destroy) client.destroy(); } catch (e) {}
+  process.exit(1);
 });
 process.on('unhandledRejection', (err) => {
-  console.error('[unhandledRejection]', err && err.stack ? err.stack : err);
+  console.error('[FATAL][unhandledRejection]', err && err.stack ? err.stack : err);
+  // 상황에 따라 계속 실행 가능하지만, 원인 파악 전 비정상 상태를 유지하지 않도록 종료 선택
+  try { if (client && client.destroy) client.destroy(); } catch (e) {}
+  process.exit(1);
 });
+
+// Heroku 일일 재시작 및 릴리스 재시작에 대비하여 정상 종료 처리
+function gracefulShutdown(sig) {
+  console.log('[Signal]', sig, 'received. shutting down gracefully.');
+  try { if (client && client.destroy) client.destroy(); } catch (e) {}
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// 게이트웨이 상태 로깅
+client.on('shardReady', (id) => console.log('[ShardReady]', id));
+client.on('shardDisconnect', (event, id) => console.log('[ShardDisconnect]', id, 'code=' + (event && event.code)));
+client.on('shardReconnecting', (id) => console.log('[ShardReconnecting]', id));
+client.on('error', (e) => console.error('[ClientError]', e && e.stack ? e.stack : e));
+client.on('warn', (w) => console.warn('[ClientWarn]', w));
+client.on('rateLimit', (info) => console.warn('[RateLimit]', JSON.stringify(info)));
+
+// 간단한 하트비트 로그로 런타임 확인
+setInterval(() => {
+  console.log('[Heartbeat]', new Date().toISOString());
+}, 10 * 60 * 1000);
 
 // ---- Discord Events ----
 client.on('ready', async () => {
