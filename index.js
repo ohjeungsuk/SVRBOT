@@ -39,6 +39,12 @@ const SPREADSHEET_ID = '1WzlRm6jlOGxTz4dTgbdMopzcJCNop8dnz7kP9GsMXZs';
 const SHEET_TITLE_FIXED = '카톡외출목록';
 const BACKUP_MAX_MESSAGES = 20000;
 
+// ---- Voice Return (복귀) Settings ----
+const WAITING_ROOM_CHANNEL_ID = '1453266042439860224';
+
+// !해산으로 이동시킨 인원 추적: guildId -> Set(userId)
+const disbandedMembersByGuild = new Map();
+
 // sheet job serialize
 let sheetQueue = Promise.resolve();
 function enqueueSheetJob(fn) {
@@ -634,10 +640,6 @@ async function handleAiChat(message) {
   const result = await callOpenAIResponses(instructionText, prompt);
 
   if (!result.ok) {
-    if (result.errorType === 'limit' || result.errorType === 'missing_key') {
-      await message.channel.send('현재 작동이 불가능 합니다');
-      return;
-    }
     await message.channel.send('현재 작동이 불가능 합니다');
     return;
   }
@@ -653,7 +655,6 @@ async function handleAiChat(message) {
 }
 
 // ---- Global Error/Signal Handling ----
-// 치명 예외는 명확 종료하여 Heroku가 즉시 재시작하도록 함.
 process.on('uncaughtException', (err) => {
   console.error('[FATAL][uncaughtException]', err && err.stack ? err.stack : err);
   try { if (client && client.destroy) client.destroy(); } catch (e) {}
@@ -661,12 +662,10 @@ process.on('uncaughtException', (err) => {
 });
 process.on('unhandledRejection', (err) => {
   console.error('[FATAL][unhandledRejection]', err && err.stack ? err.stack : err);
-  // 상황에 따라 계속 실행 가능하지만, 원인 파악 전 비정상 상태를 유지하지 않도록 종료 선택
   try { if (client && client.destroy) client.destroy(); } catch (e) {}
   process.exit(1);
 });
 
-// Heroku 일일 재시작 및 릴리스 재시작에 대비하여 정상 종료 처리
 function gracefulShutdown(sig) {
   console.log('[Signal]', sig, 'received. shutting down gracefully.');
   try { if (client && client.destroy) client.destroy(); } catch (e) {}
@@ -675,7 +674,6 @@ function gracefulShutdown(sig) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// 게이트웨이 상태 로깅
 client.on('shardReady', (id) => console.log('[ShardReady]', id));
 client.on('shardDisconnect', (event, id) => console.log('[ShardDisconnect]', id, 'code=' + (event && event.code)));
 client.on('shardReconnecting', (id) => console.log('[ShardReconnecting]', id));
@@ -683,7 +681,6 @@ client.on('error', (e) => console.error('[ClientError]', e && e.stack ? e.stack 
 client.on('warn', (w) => console.warn('[ClientWarn]', w));
 client.on('rateLimit', (info) => console.warn('[RateLimit]', JSON.stringify(info)));
 
-// 간단한 하트비트 로그로 런타임 확인
 setInterval(() => {
   console.log('[Heartbeat]', new Date().toISOString());
 }, 10 * 60 * 1000);
@@ -709,7 +706,6 @@ client.on('message', async (message) => {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
-  // 기존: 타겟 채널 양식 기록
   if (isTargetChannelOrThread(message)) {
     console.log(
       '[MSG] recv',
@@ -721,19 +717,16 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
-  // AI 대화: 인증된 채널에서만, 명령어 제외
   if (message.guild && isAiChannelOrThread(message) && (!message.content || !message.content.startsWith(prefix))) {
     enqueueAiJob(String(message.guild.id), () => handleAiChat(message));
     return;
   }
 
-  // 명령어 처리
   if (!message.content || !message.content.startsWith(prefix)) return;
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  // AI 채널 인증
   if (command === '인증') {
     if (!message.guild) return;
     if (!message.member || !message.member.hasPermission('ADMINISTRATOR')) {
@@ -803,6 +796,11 @@ client.on('message', async (message) => {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
     }
 
+    // 해산 기록 초기화(이번 해산 인원만 복귀 대상)
+    if (message.guild) {
+      disbandedMembersByGuild.set(String(message.guild.id), new Set());
+    }
+
     const voiceChannelIds = [
       '1450857003521015921', '1450857559715217560', '1450857466312261786',
       '1450857664388005980', '1450857791789989971', '1450857978289983568',
@@ -818,6 +816,10 @@ client.on('message', async (message) => {
       team.forEach(name => {
         const member = message.guild.members.cache.find(m => m.displayName === name);
         if (member && member.voice.channel) {
+          // 해산 대상 기록
+          const set = disbandedMembersByGuild.get(String(message.guild.id));
+          if (set) set.add(String(member.id));
+
           member.voice.setChannel(channel).catch(err => {
             console.error('이동 실패:', member.displayName, err.message);
           });
@@ -826,6 +828,50 @@ client.on('message', async (message) => {
     });
 
     message.channel.send('모든 인원을 이동 시켰습니다!!! @here');
+    return;
+  }
+
+  // NEW: !복귀 - 해산으로 이동시킨 인원들을 대기실로 이동
+  if (command === '복귀') {
+    if (!message.guild) return;
+
+    const waiting = message.guild.channels.cache.get(WAITING_ROOM_CHANNEL_ID);
+    if (!waiting || waiting.type !== 'voice') {
+      return message.reply('복귀 실패: 대기실 채널이 없거나 음성 채널이 아님.');
+    }
+
+    const set = disbandedMembersByGuild.get(String(message.guild.id));
+    if (!set || set.size === 0) {
+      return message.reply('복귀할 인원이 없다. 먼저 !해산을 실행해야 한다.');
+    }
+
+    let moved = 0;
+    let tried = 0;
+
+    for (const userId of set.values()) {
+      tried++;
+
+      const member = message.guild.members.cache.get(String(userId));
+      if (!member) continue;
+
+      // 음성에 있어야 이동 가능
+      if (!member.voice || !member.voice.channel) continue;
+
+      // 이미 대기실이면 스킵
+      if (String(member.voice.channel.id) === String(WAITING_ROOM_CHANNEL_ID)) continue;
+
+      try {
+        await member.voice.setChannel(waiting);
+        moved++;
+      } catch (e) {
+        console.error('[Return] move failed:', member.displayName, e && e.message ? e.message : e);
+      }
+    }
+
+    // 이번 해산 기록은 정리
+    disbandedMembersByGuild.set(String(message.guild.id), new Set());
+
+    message.channel.send('복귀 완료: 이동 ' + moved + '명 (대상 ' + tried + '명)');
     return;
   }
 
@@ -901,7 +947,9 @@ client.on('message', async (message) => {
     message.channel.send(
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
       `**듀오 구인구직 사용방법!**\n음성채널 생성 후 \`\`!듀오\`\` 입력하면 듀오(2인) 초대링크 생성\n\n` +
-      `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함] \n 해당 봇 저작권은 도비에게 있습니다. `
+      `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함]\n` +
+      `**복귀 사용방법!**\n\`\`!복귀\`\` 입력 시 마지막 !해산으로 이동된 인원들을 대기실로 이동\n` +
+      `해당 봇 저작권은 도비에게 있습니다. `
     );
     return;
   }
