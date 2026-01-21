@@ -989,6 +989,52 @@ client.on('message', async (message) => {
     return;
   }
 
+
+
+    // NEW: !복귀 - 해산으로 이동시킨 인원들을 대기실로 이동
+  if (command === '복귀') {
+    if (!message.guild) return;
+
+    const waiting = message.guild.channels.cache.get(WAITING_ROOM_CHANNEL_ID);
+    if (!waiting || waiting.type !== 'voice') {
+      return message.reply('복귀 실패: 대기실 채널이 없거나 음성 채널이 아님.');
+    }
+
+    const set = disbandedMembersByGuild.get(String(message.guild.id));
+    if (!set || set.size === 0) {
+      return message.reply('복귀할 인원이 없다. 먼저 !해산을 실행해야 한다.');
+    }
+
+    let moved = 0;
+    let tried = 0;
+
+    for (const userId of set.values()) {
+      tried++;
+
+      const member = message.guild.members.cache.get(String(userId));
+      if (!member) continue;
+
+      // 음성에 있어야 이동 가능
+      if (!member.voice || !member.voice.channel) continue;
+
+      // 이미 대기실이면 스킵
+      if (String(member.voice.channel.id) === String(WAITING_ROOM_CHANNEL_ID)) continue;
+
+      try {
+        await member.voice.setChannel(waiting);
+        moved++;
+      } catch (e) {
+        console.error('[Return] move failed:', member.displayName, e && e.message ? e.message : e);
+      }
+    }
+
+    // 이번 해산 기록은 정리
+    disbandedMembersByGuild.set(String(message.guild.id), new Set());
+
+    message.channel.send('복귀 완료: 이동 ' + moved + '명 (대상 ' + tried + '명)');
+    return;
+  }
+
   if (command === '놀자') {
     const maxMembers = 4;
 
