@@ -1,4 +1,4 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger + GPT API via OpenAI Responses)
+// index.js (discord.js v12.5.3 + Google Sheets logger + GPT API via OpenAI Responses + Auto Renumber Voice Channels)
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
@@ -39,11 +39,119 @@ const SPREADSHEET_ID = '1WzlRm6jlOGxTz4dTgbdMopzcJCNop8dnz7kP9GsMXZs';
 const SHEET_TITLE_FIXED = '카톡외출목록';
 const BACKUP_MAX_MESSAGES = 20000;
 
-// ---- Voice Return (복귀) Settings ----
-const WAITING_ROOM_CHANNEL_ID = '1453266042439860224';
+// ---- Auto Renumber Voice Channels (PartyBeast) ----
+// 네가 준 카테고리 ID 기준
+// 듀오방1/2/3, 일반방1/2/3, 경쟁방1/2/3, 빡겜방1/2/3
+const RENUMBER_RULES = [
+  { categoryId: '1456630426247499918', prefix: '듀오방' },
+  { categoryId: '1453251021282476084', prefix: '일반방' },
+  { categoryId: '1453251462586171446', prefix: '경쟁방' },
+  { categoryId: '1453257882438205531', prefix: '빡겜방' },
+];
 
-// !해산으로 이동시킨 인원 추적: guildId -> Set(userId)
-const disbandedMembersByGuild = new Map();
+// guildId -> Promise (serialize renumber jobs)
+const renumberQueueByGuild = new Map();
+// key: guildId:categoryId -> timeoutId (debounce)
+const renumberTimerByKey = new Map();
+
+function enqueueRenumberJob(guildId, fn) {
+  const gid = String(guildId || '');
+  const prev = renumberQueueByGuild.get(gid) || Promise.resolve();
+  const next = prev.then(fn).catch((err) => {
+    console.error('[RenumberJobError]', err && err.stack ? err.stack : err);
+  });
+  renumberQueueByGuild.set(gid, next);
+  return next;
+}
+
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getRuleByCategoryId(categoryId) {
+  const cid = String(categoryId || '');
+  for (let i = 0; i < RENUMBER_RULES.length; i++) {
+    if (String(RENUMBER_RULES[i].categoryId) === cid) return RENUMBER_RULES[i];
+  }
+  return null;
+}
+
+function parseNumberedName(name, prefix) {
+  if (!name) return null;
+  const re = new RegExp('^\\s*' + escapeRegex(prefix) + '\\s*(\\d+)\\s*$');
+  const m = String(name).match(re);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (isNaN(n) || n < 1) return null;
+  return n;
+}
+
+async function renumberCategory(guild, categoryId, prefix) {
+  if (!guild || !categoryId || !prefix) return;
+
+  const cid = String(categoryId);
+  const channels = guild.channels.cache
+    .filter((ch) => ch && ch.type === 'voice' && String(ch.parentID || '') === cid)
+    .array();
+
+  const items = [];
+  for (let i = 0; i < channels.length; i++) {
+    const ch = channels[i];
+    const num = parseNumberedName(ch.name, prefix);
+    if (num === null) continue;
+    items.push({ ch: ch, num: num });
+  }
+
+  if (items.length <= 1) return;
+
+  items.sort((a, b) => a.num - b.num);
+
+  // 연속 번호로 재정렬
+  let changed = 0;
+  for (let i = 0; i < items.length; i++) {
+    const targetNum = i + 1;
+    const targetName = prefix + String(targetNum);
+    const ch = items[i].ch;
+
+    if (!ch || !ch.name) continue;
+    if (String(ch.name) === targetName) continue;
+
+    try {
+      // reason은 ASCII로만
+      await ch.setName(targetName, 'auto renumber');
+      changed++;
+    } catch (e) {
+      console.error('[Renumber] setName failed', 'cid=' + cid, 'old=' + ch.name, 'new=' + targetName, e && e.message ? e.message : e);
+    }
+  }
+
+  if (changed > 0) {
+    console.log('[Renumber] done', 'category=' + cid, 'prefix=' + prefix, 'changed=' + String(changed));
+  }
+}
+
+function scheduleRenumber(guild, categoryId) {
+  if (!guild || !categoryId) return;
+
+  const rule = getRuleByCategoryId(categoryId);
+  if (!rule) return;
+
+  const key = String(guild.id) + ':' + String(categoryId);
+  const old = renumberTimerByKey.get(key);
+  if (old) {
+    try { clearTimeout(old); } catch (e) {}
+  }
+
+  // 파티비스트가 연속적으로 만들고/지우는 경우가 있어서 약간 디바운스
+  const t = setTimeout(() => {
+    renumberTimerByKey.delete(key);
+    enqueueRenumberJob(String(guild.id), async () => {
+      await renumberCategory(guild, rule.categoryId, rule.prefix);
+    });
+  }, 1500);
+
+  renumberTimerByKey.set(key, t);
+}
 
 // sheet job serialize
 let sheetQueue = Promise.resolve();
@@ -685,6 +793,48 @@ setInterval(() => {
   console.log('[Heartbeat]', new Date().toISOString());
 }, 10 * 60 * 1000);
 
+// ---- Auto Renumber Events ----
+client.on('channelDelete', (channel) => {
+  try {
+    if (!channel || channel.type !== 'voice') return;
+    if (!channel.guild) return;
+    if (!channel.parentID) return;
+    scheduleRenumber(channel.guild, channel.parentID);
+  } catch (e) {
+    console.error('[Renumber] channelDelete handler error', e && e.stack ? e.stack : e);
+  }
+});
+
+client.on('channelCreate', (channel) => {
+  try {
+    if (!channel || channel.type !== 'voice') return;
+    if (!channel.guild) return;
+    if (!channel.parentID) return;
+    scheduleRenumber(channel.guild, channel.parentID);
+  } catch (e) {
+    console.error('[Renumber] channelCreate handler error', e && e.stack ? e.stack : e);
+  }
+});
+
+client.on('channelUpdate', (oldChannel, newChannel) => {
+  try {
+    if (!oldChannel || !newChannel) return;
+    if (newChannel.type !== 'voice') return;
+    if (!newChannel.guild) return;
+
+    const oldParent = String(oldChannel.parentID || '');
+    const newParent = String(newChannel.parentID || '');
+
+    // 카테고리 이동이 있을 때만
+    if (oldParent !== newParent) {
+      if (oldParent) scheduleRenumber(newChannel.guild, oldParent);
+      if (newParent) scheduleRenumber(newChannel.guild, newParent);
+    }
+  } catch (e) {
+    console.error('[Renumber] channelUpdate handler error', e && e.stack ? e.stack : e);
+  }
+});
+
 // ---- Discord Events ----
 client.on('ready', async () => {
   console.log('[Bot] LoggedInAs:', client.user.tag);
@@ -699,6 +849,19 @@ client.on('ready', async () => {
   } catch (e) {
     console.error('[SheetsInitFailed]', e && e.stack ? e.stack : e);
   }
+
+  // 부팅 시 한번 정리 (캐시 안정화 후)
+  setTimeout(() => {
+    try {
+      client.guilds.cache.forEach((g) => {
+        for (let i = 0; i < RENUMBER_RULES.length; i++) {
+          scheduleRenumber(g, RENUMBER_RULES[i].categoryId);
+        }
+      });
+    } catch (e) {
+      console.error('[Renumber] startup reconcile error', e && e.stack ? e.stack : e);
+    }
+  }, 4000);
 });
 
 // 메시지 작성 시
@@ -706,6 +869,7 @@ client.on('message', async (message) => {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
+  // 기존: 타겟 채널 양식 기록
   if (isTargetChannelOrThread(message)) {
     console.log(
       '[MSG] recv',
@@ -717,16 +881,19 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
+  // AI 대화: 인증된 채널에서만, 명령어 제외
   if (message.guild && isAiChannelOrThread(message) && (!message.content || !message.content.startsWith(prefix))) {
     enqueueAiJob(String(message.guild.id), () => handleAiChat(message));
     return;
   }
 
+  // 명령어 처리
   if (!message.content || !message.content.startsWith(prefix)) return;
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
+  // AI 채널 인증
   if (command === '인증') {
     if (!message.guild) return;
     if (!message.member || !message.member.hasPermission('ADMINISTRATOR')) {
@@ -796,11 +963,6 @@ client.on('message', async (message) => {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
     }
 
-    // 해산 기록 초기화(이번 해산 인원만 복귀 대상)
-    if (message.guild) {
-      disbandedMembersByGuild.set(String(message.guild.id), new Set());
-    }
-
     const voiceChannelIds = [
       '1450857003521015921', '1450857559715217560', '1450857466312261786',
       '1450857664388005980', '1450857791789989971', '1450857978289983568',
@@ -816,62 +978,14 @@ client.on('message', async (message) => {
       team.forEach(name => {
         const member = message.guild.members.cache.find(m => m.displayName === name);
         if (member && member.voice.channel) {
-          // 해산 대상 기록
-          const set = disbandedMembersByGuild.get(String(message.guild.id));
-          if (set) set.add(String(member.id));
-
           member.voice.setChannel(channel).catch(err => {
-            console.error('이동 실패:', member.displayName, err.message);
+            console.error('move failed:', member.displayName, err.message);
           });
         }
       });
     });
 
     message.channel.send('모든 인원을 이동 시켰습니다!!! @here');
-    return;
-  }
-
-  // NEW: !복귀 - 해산으로 이동시킨 인원들을 대기실로 이동
-  if (command === '복귀') {
-    if (!message.guild) return;
-
-    const waiting = message.guild.channels.cache.get(WAITING_ROOM_CHANNEL_ID);
-    if (!waiting || waiting.type !== 'voice') {
-      return message.reply('복귀 실패: 대기실 채널이 없거나 음성 채널이 아님.');
-    }
-
-    const set = disbandedMembersByGuild.get(String(message.guild.id));
-    if (!set || set.size === 0) {
-      return message.reply('복귀할 인원이 없다. 먼저 !해산을 실행해야 한다.');
-    }
-
-    let moved = 0;
-    let tried = 0;
-
-    for (const userId of set.values()) {
-      tried++;
-
-      const member = message.guild.members.cache.get(String(userId));
-      if (!member) continue;
-
-      // 음성에 있어야 이동 가능
-      if (!member.voice || !member.voice.channel) continue;
-
-      // 이미 대기실이면 스킵
-      if (String(member.voice.channel.id) === String(WAITING_ROOM_CHANNEL_ID)) continue;
-
-      try {
-        await member.voice.setChannel(waiting);
-        moved++;
-      } catch (e) {
-        console.error('[Return] move failed:', member.displayName, e && e.message ? e.message : e);
-      }
-    }
-
-    // 이번 해산 기록은 정리
-    disbandedMembersByGuild.set(String(message.guild.id), new Set());
-
-    message.channel.send('복귀 완료: 이동 ' + moved + '명 (대상 ' + tried + '명)');
     return;
   }
 
@@ -947,9 +1061,7 @@ client.on('message', async (message) => {
     message.channel.send(
       `**구인구직 사용방법!**\n음성채널 생성 후 \`\`!놀자\`\` 입력하면 자동으로 초대링크 생성\n\n` +
       `**듀오 구인구직 사용방법!**\n음성채널 생성 후 \`\`!듀오\`\` 입력하면 듀오(2인) 초대링크 생성\n\n` +
-      `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함]\n` +
-      `**복귀 사용방법!**\n\`\`!복귀\`\` 입력 시 마지막 !해산으로 이동된 인원들을 대기실로 이동\n` +
-      `해당 봇 저작권은 도비에게 있습니다. `
+      `**팀 짜기 사용방법!**\n내전 대기실 입장 후 \`\`!팀 N\`\` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다 !\n[관전 적용된 인원은미포함] \n 해당 봇 저작권은 도비에게 있습니다. `
     );
     return;
   }
