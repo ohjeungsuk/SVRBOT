@@ -63,6 +63,18 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ---- 균등 랜덤 셔플(Fisher–Yates) ----
+function shuffleArray(array) {
+  const result = array.slice(); // 원본 보호
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = result[i];
+    result[i] = result[j];
+    result[j] = tmp;
+  }
+  return result;
+}
+
 // sheet job serialize
 let sheetQueue = Promise.resolve();
 function enqueueSheetJob(fn) {
@@ -952,64 +964,61 @@ client.on('message', async (message) => {
   }
 
   if (command === '팀') {
-  const n = parseInt(args[0], 10);
-  if (isNaN(n) || n < 1) {
-    return message.reply('올바른 인원 수를 입력해주세요.');
-  }
+    const n = parseInt(args[0], 10);
+    if (isNaN(n) || n < 1) {
+      return message.reply('올바른 인원 수를 입력해주세요.');
+    }
 
-  const voiceChannel = message.member.voice.channel;
-  if (!voiceChannel) {
-    return message.reply('음성 채널에 들어가 주세요.');
-  }
+    const voiceChannel = message.member.voice.channel;
+    if (!voiceChannel) {
+      return message.reply('음성 채널에 들어가 주세요.');
+    }
 
-  const SPECTATOR_TAG = /\[관전\]/i;
-  const members = voiceChannel.members
-    .filter(m => {
-      const name = m.displayName || m.user.username || '';
-      return !m.user.bot && !SPECTATOR_TAG.test(name);
-    })
-    .array();
+    const SPECTATOR_TAG = /\[관전\]/i;
+    const members = voiceChannel.members
+      .filter(m => {
+        const name = m.displayName || m.user.username || '';
+        return !m.user.bot && !SPECTATOR_TAG.test(name);
+      })
+      .array();
 
-  if (members.length < n) {
-    return message.reply('음성 채널에 인원이 부족합니다.');
-  }
+    if (members.length < n) {
+      return message.reply('음성 채널에 인원이 부족합니다.');
+    }
 
-  // 여기만 변경: sort 기반 셔플 제거, Fisher–Yates 셔플 사용
-  const shuffledMembers = shuffleArray(members);
+    // 강화된 랜덤 셔플 사용
+    const shuffledMembers = shuffleArray(members);
 
-  const teams = [];
-  let restMembers = shuffledMembers.length;
+    const teams = [];
+    let restMembers = shuffledMembers.length;
 
-  while (restMembers > 0) {
-    const teamSize = Math.min(restMembers, n);
-    const startIndex = teams.length * n;
-    const teamMembers = shuffledMembers.slice(startIndex, startIndex + teamSize);
-    teams.push(teamMembers.map(member => member.displayName));
-    restMembers -= teamSize;
-  }
+    while (restMembers > 0) {
+      const teamSize = Math.min(restMembers, n);
+      const startIndex = teams.length * n;
+      const teamMembers = shuffledMembers.slice(startIndex, startIndex + teamSize);
+      teams.push(teamMembers.map(member => member.displayName));
+      restMembers -= teamSize;
+    }
 
-  latestTeams = teams;
+    latestTeams = teams;
 
-  const selectedTeamIndex = Math.floor(Math.random() * teams.length);
-  const selectedTeamName = (selectedTeamIndex + 1) + ' 팀';
-  const randomMessage = selectedTeamName + '이 좀 치네...?';
+    const selectedTeamIndex = Math.floor(Math.random() * teams.length);
+    const selectedTeamName = (selectedTeamIndex + 1) + ' 팀';
+    const randomMessage = selectedTeamName + '이 좀 치네...?';
 
-  let teamMessage = '**새로운 팀이 구성되었습니다!**\n나와 함께 할 팀은???\n\n';
-  teams.forEach((team, i) => {
-    teamMessage += '```\nTeam ' + (i + 1) + '\n';
-    team.forEach(name => {
-      teamMessage += name + '\n';
+    let teamMessage = '**새로운 팀이 구성되었습니다!**\n나와 함께 할 팀은???\n\n';
+    teams.forEach((team, i) => {
+      teamMessage += '```\nTeam ' + (i + 1) + '\n';
+      team.forEach(name => {
+        teamMessage += name + '\n';
+      });
+      teamMessage += '```\n';
     });
-    teamMessage += '```\n';
-  });
 
-  message.channel.send(teamMessage);
-  message.channel.send(randomMessage);
-  return;
-}
-
-
-
+    message.channel.send(teamMessage);
+    message.channel.send(randomMessage);
+    return;
+  }
 
   if (command === '해산') {
     if (latestTeams.length === 0) {
