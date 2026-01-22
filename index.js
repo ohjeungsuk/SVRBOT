@@ -63,7 +63,7 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// 팀 셔플용: Fisher–Yates 셔플 (기존 sort(Math.random)보다 훨씬 랜덤성 좋음)
+// 팀 셔플용: Fisher–Yates 셔플
 function shuffleArray(inputArray) {
   const arr = inputArray.slice();
   for (let i = arr.length - 1; i > 0; i--) {
@@ -688,25 +688,54 @@ async function handleAiChat(message) {
 
 // ---- PUBG Patch Notes Helper Functions ----
 
-// PUBG 뉴스 HTML 다운로드
+// PUBG 뉴스 HTML 다운로드 (브라우저 User-Agent 사용, 403 회피)
 function fetchHtml(url) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error('HTTP ' + res.statusCode));
-          return;
-        }
-        resolve(data);
-      });
-    });
+    const req = https.request(
+      url,
+      {
+        method: 'GET',
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept':
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+        },
+        timeout: 15000,
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+        res.on('end', () => {
+          // 간단한 리다이렉트 처리 (3xx)
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            const loc = res.headers.location;
+            const nextUrl = loc.startsWith('http') ? loc : 'https://pubg.com' + loc;
+            fetchHtml(nextUrl).then(resolve).catch(reject);
+            return;
+          }
+
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error('HTTP ' + res.statusCode));
+            return;
+          }
+          resolve(data);
+        });
+      }
+    );
+
     req.on('error', (err) => reject(err));
     req.setTimeout(15000, () => {
-      try { req.destroy(new Error('timeout')); } catch (e) {}
+      try {
+        req.destroy(new Error('timeout'));
+      } catch (e) {}
       reject(new Error('timeout'));
     });
+    req.end();
   });
 }
 
@@ -1079,7 +1108,7 @@ client.on('message', async (message) => {
     return;
   }
 
-  // PUBG 최신 패치노트 요약
+  // PUBG 최신 패치노트 요약 (텍스트 출력)
   if (command === '배그패치') {
     try {
       await message.channel.send('배틀그라운드 최신 패치 노트를 가져오는 중...');
@@ -1089,17 +1118,13 @@ client.on('message', async (message) => {
         return;
       }
 
-      const embed = new Discord.MessageEmbed()
-        .setTitle(result.title)
-        .setURL(result.url)
-        .setDescription(result.summary)
-        .setTimestamp();
+      let out = '';
+      out += '**배틀그라운드 최신 패치 노트 요약**\n';
+      out += '제목: ' + result.title + '\n\n';
+      out += result.summary + '\n\n';
+      out += '원문 페이지: ' + result.url;
 
-      if (result.imageUrl) {
-        embed.setImage(result.imageUrl);
-      }
-
-      await message.channel.send(embed);
+      await sendLongText(message.channel, out);
     } catch (e) {
       console.error('[배그패치] failed:', e && e.stack ? e.stack : e);
       try {
@@ -1168,7 +1193,6 @@ client.on('message', async (message) => {
       return message.reply('음성 채널에 인원이 부족합니다.');
     }
 
-    // Fisher–Yates 셔플 사용
     const shuffledMembers = shuffleArray(members);
 
     const teams = [];
