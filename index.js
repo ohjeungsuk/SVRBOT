@@ -951,7 +951,7 @@ client.on('message', async (message) => {
     return;
   }
 
-if (command === '팀') {
+  if (command === '팀') {
   const n = parseInt(args[0], 10);
   if (isNaN(n) || n < 1) {
     return message.reply('올바른 인원 수를 입력해주세요.');
@@ -1007,6 +1007,8 @@ if (command === '팀') {
   message.channel.send(randomMessage);
   return;
 }
+
+
 
 
   if (command === '해산') {
