@@ -1,4 +1,4 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger + GPT API via OpenAI Responses + !복귀 + PartyBeast room renumber)
+// index.js (discord.js v12.5.3 + Google Sheets logger + GPT API via OpenAI Responses + !복귀 + PartyBeast room renumber + PUBG Patch Notes)
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
@@ -63,16 +63,16 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---- 균등 랜덤 셔플(Fisher–Yates) ----
-function shuffleArray(array) {
-  const result = array.slice(); // 원본 보호
-  for (let i = result.length - 1; i > 0; i--) {
+// 팀 셔플용: Fisher–Yates 셔플 (기존 sort(Math.random)보다 훨씬 랜덤성 좋음)
+function shuffleArray(inputArray) {
+  const arr = inputArray.slice();
+  for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    const tmp = result[i];
-    result[i] = result[j];
-    result[j] = tmp;
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
   }
-  return result;
+  return arr;
 }
 
 // sheet job serialize
@@ -686,6 +686,156 @@ async function handleAiChat(message) {
   await sendLongText(message.channel, out);
 }
 
+// ---- PUBG Patch Notes Helper Functions ----
+
+// PUBG 뉴스 HTML 다운로드
+function fetchHtml(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error('HTTP ' + res.statusCode));
+          return;
+        }
+        resolve(data);
+      });
+    });
+    req.on('error', (err) => reject(err));
+    req.setTimeout(15000, () => {
+      try { req.destroy(new Error('timeout')); } catch (e) {}
+      reject(new Error('timeout'));
+    });
+  });
+}
+
+// 메타 태그에서 og:title / og:image 같은거 뽑기
+function extractMetaContent(html, property) {
+  const re = new RegExp('<meta[^>]+property="' + property.replace(/"/g, '\\"') + '"[^>]+content="([^"]+)"', 'i');
+  const m = html.match(re);
+  return m ? m[1] : '';
+}
+
+// HTML 태그 제거하고 텍스트만 추출
+function stripHtmlTags(html) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// PUBG 패치노트 본문 영역만 대충 잘라내기
+function extractPubgArticleText(html) {
+  let body = '';
+  let start = html.indexOf('<article');
+  if (start >= 0) {
+    let end = html.indexOf('</article>', start);
+    if (end > start) {
+      body = html.slice(start, end + 10);
+    }
+  }
+  if (!body) {
+    start = html.indexOf('<main');
+    if (start >= 0) {
+      const end = html.indexOf('</main>', start);
+      if (end > start) {
+        body = html.slice(start, end + 7);
+      }
+    }
+  }
+  if (!body) {
+    body = html;
+  }
+
+  let text = stripHtmlTags(body);
+  if (text.length > 6000) {
+    text = text.slice(0, 6000);
+  }
+  return text;
+}
+
+// news?category=patch_notes 페이지에서 가장 최신 패치노트 글 URL 찾기
+function findLatestPatchUrl(listHtml) {
+  const marker = '패치 노트 - ';
+  const idx = listHtml.indexOf(marker);
+  if (idx < 0) return null;
+
+  const slice = listHtml.slice(0, idx);
+  const aIdx = slice.lastIndexOf('<a ');
+  if (aIdx < 0) return null;
+
+  const aPart = slice.slice(aIdx);
+  const hrefMatch = aPart.match(/href="([^"]+)"/i);
+  if (!hrefMatch) return null;
+
+  let href = hrefMatch[1];
+  if (href.startsWith('//')) {
+    href = 'https:' + href;
+  } else if (href.startsWith('/')) {
+    href = 'https://pubg.com' + href;
+  } else if (!href.startsWith('http')) {
+    href = 'https://pubg.com' + (href.startsWith('/') ? '' : '/') + href;
+  }
+  return href;
+}
+
+// 최신 패치노트 불러와서 요약까지 수행
+async function fetchLatestPubgPatchNoteSummary() {
+  const listUrl = 'https://pubg.com/ko/news?category=patch_notes';
+  const listHtml = await fetchHtml(listUrl);
+  const articleUrl = findLatestPatchUrl(listHtml);
+  if (!articleUrl) {
+    return { ok: false, reason: 'no_article' };
+  }
+
+  const articleHtml = await fetchHtml(articleUrl);
+  const title = extractMetaContent(articleHtml, 'og:title') || '배틀그라운드 최신 패치 노트';
+  const imageUrl = extractMetaContent(articleHtml, 'og:image') || '';
+  const rawText = extractPubgArticleText(articleHtml);
+
+  const instructions =
+    '너는 배틀그라운드(PUBG) 패치노트를 한국어로 요약하는 도우미다. ' +
+    '입력으로 주어진 텍스트는 패치노트 본문이다. ' +
+    '핵심 변경 사항을 5~10개 bullet 목록으로 요약해라. ' +
+    '각 bullet은 간단명료하게 쓰고, 굳이 중요하지 않은 자잘한 수치는 생략해도 된다. ' +
+    '디스코드 메시지에 바로 붙여 넣을 수 있도록 깔끔한 목록 형태로 출력해라.';
+
+  const input =
+    '다음은 배틀그라운드 패치노트 텍스트다.\n\n' +
+    rawText +
+    '\n\n위 내용을 기반으로 핵심 변경점만 정리해서 bullet 목록으로 요약해줘.';
+
+  const aiResult = await callOpenAIResponses(instructions, input);
+
+  if (!aiResult.ok) {
+    // AI 요약 실패 시, 원문 일부만 잘라서 반환
+    return {
+      ok: true,
+      title: title,
+      url: articleUrl,
+      imageUrl: imageUrl,
+      summary: rawText.slice(0, 1500) + '...',
+    };
+  }
+
+  const summary = aiResult.text && aiResult.text.trim()
+    ? aiResult.text.trim()
+    : rawText.slice(0, 1500) + '...';
+
+  return {
+    ok: true,
+    title: title,
+    url: articleUrl,
+    imageUrl: imageUrl,
+    summary: summary,
+  };
+}
+
 // ---- PartyBeast Room Renumber Implementation ----
 const renumberTimers = new Map();      // key: guildId:categoryId -> timeout
 const renumberQueues = new Map();      // key: guildId:categoryId -> Promise
@@ -929,6 +1079,36 @@ client.on('message', async (message) => {
     return;
   }
 
+  // PUBG 최신 패치노트 요약
+  if (command === '배그패치') {
+    try {
+      await message.channel.send('배틀그라운드 최신 패치 노트를 가져오는 중...');
+      const result = await fetchLatestPubgPatchNoteSummary();
+      if (!result.ok) {
+        await message.channel.send('패치 노트 정보를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.');
+        return;
+      }
+
+      const embed = new Discord.MessageEmbed()
+        .setTitle(result.title)
+        .setURL(result.url)
+        .setDescription(result.summary)
+        .setTimestamp();
+
+      if (result.imageUrl) {
+        embed.setImage(result.imageUrl);
+      }
+
+      await message.channel.send(embed);
+    } catch (e) {
+      console.error('[배그패치] failed:', e && e.stack ? e.stack : e);
+      try {
+        await message.channel.send('패치 노트 정보를 가져오는 중 오류가 발생했습니다.');
+      } catch (ee) {}
+    }
+    return;
+  }
+
   // !복귀: 마지막 !해산으로 이동된 인원들을 대기실로 이동
   if (command === '복귀') {
     if (!message.guild) return;
@@ -988,7 +1168,7 @@ client.on('message', async (message) => {
       return message.reply('음성 채널에 인원이 부족합니다.');
     }
 
-    // 강화된 랜덤 셔플 사용
+    // Fisher–Yates 셔플 사용
     const shuffledMembers = shuffleArray(members);
 
     const teams = [];
