@@ -1182,12 +1182,146 @@ function uniquePush(arr, v) {
   arr.push(s);
 }
 
+function detectLocaleFromUrl(u) {
+  try {
+    const p = new URL(String(u)).pathname.split('/').filter(Boolean);
+    if (p.length > 0 && /^[a-z]{2}(?:-[a-z]{2})?$/i.test(p[0])) return String(p[0]).toLowerCase();
+  } catch (e) {}
+  return '';
+}
+
+// PUBG 뉴스는 최근 /news/9635 처럼 3~7자리 숫자 ID를 사용한다.
+// 8자리(YYYYMMDD) 형태는 구형/다른 페이지에서 섞여 들어오는 경우가 있어 패치노트 후보에서 제외한다.
 function parseNewsIdFromUrl(u) {
-  const m = String(u || '').match(/\/news\/(\d{3,10})(?:\D|$)/i);
+  const s = String(u || '');
+  const m = s.match(/\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?news\/(\d{3,7})(?:[/?#]|$)/i);
   if (!m) return 0;
   const n = parseInt(m[1], 10);
   return isNaN(n) ? 0 : n;
 }
+
+function normalizeNewsUrlToLocale(absUrl, baseUrl) {
+  try {
+    const bu = new URL(String(baseUrl));
+    const au = new URL(String(absUrl));
+    const locale = detectLocaleFromUrl(bu.toString()) || 'ko';
+
+    // origin 통일(리다이렉트/서브도메인 섞임 방지)
+    au.protocol = bu.protocol;
+    au.host = bu.host;
+
+    // /news/ID  -> /{locale}/news/ID
+    if (/^\/news\/\d{3,7}(?:[/?#]|$)/i.test(au.pathname)) {
+      au.pathname = '/' + locale + au.pathname;
+      return au.toString();
+    }
+
+    // /xx/news/ID -> locale로 강제
+    const m = au.pathname.match(/^\/([a-z]{2}(?:-[a-z]{2})?)\/news\/(\d{3,7})(?:[/?#]|$)/i);
+    if (m) {
+      const id = m[2];
+      au.pathname = '/' + locale + '/news/' + id;
+      return au.toString();
+    }
+
+    return au.toString();
+  } catch (e) {
+    return String(absUrl || '');
+  }
+}
+
+function buildNewsUrlForId(baseUrl, id) {
+  try {
+    const bu = new URL(String(baseUrl));
+    const locale = detectLocaleFromUrl(bu.toString()) || 'ko';
+    const n = parseInt(String(id), 10);
+    if (isNaN(n)) return '';
+    return bu.origin + '/' + locale + '/news/' + String(n);
+  } catch (e) {
+    return '';
+  }
+}
+
+function collectPatchNewsObjectsFromNextData(nextObj, limit) {
+  const out = [];
+  const seen = {};
+
+  function add(id, title, category, label, dateStr) {
+    const n = parseInt(String(id), 10);
+    if (isNaN(n)) return;
+    const idLen = String(n).length;
+    if (idLen >= 8) return; // YYYYMMDD 차단
+    if (idLen < 3 || idLen > 7) return;
+    if (seen[n]) return;
+    seen[n] = 1;
+
+    const t = String(title || '');
+    const c = String(category || '');
+    const l = String(label || '');
+    const d = String(dateStr || '');
+
+    const tLower = t.toLowerCase();
+    const cLower = c.toLowerCase();
+    const lLower = l.toLowerCase();
+
+    let score = 0;
+    if (cLower.indexOf('patch') >= 0 || cLower.indexOf('patch_notes') >= 0) score += 60;
+    if (tLower.indexOf('patch') >= 0 || t.indexOf('패치') >= 0) score += 50;
+    if (t.indexOf('업데이트') >= 0 || tLower.indexOf('update') >= 0) score += 20;
+    if (lLower.indexOf('pc') >= 0 || lLower.indexOf('label_pc') >= 0) score += 10;
+    if (d) score += 2;
+
+    out.push({ id: n, title: t, category: c, label: l, date: d, score: score });
+  }
+
+  const stack = [nextObj];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur) continue;
+
+    if (Array.isArray(cur)) {
+      for (let i = 0; i < cur.length; i++) stack.push(cur[i]);
+      continue;
+    }
+
+    const t = typeof cur;
+    if (t === 'object') {
+      try {
+        const id = cur.id || cur.newsId || cur.postId || cur.articleId;
+        const title = cur.title || cur.name || cur.subject;
+        const category = cur.category || cur.categoryName || cur.categoryCode || cur.category_code;
+        const label = cur.label || cur.labelCode || cur.tag || cur.platform || cur.device;
+        const dateStr = cur.publishDate || cur.publishedAt || cur.createdAt || cur.date;
+
+        if (id && title) {
+          const titleStr = String(title);
+          const catStr = String(category || '');
+          if (titleStr.indexOf('패치') >= 0 || titleStr.indexOf('업데이트') >= 0 || titleStr.toLowerCase().indexOf('patch') >= 0 || catStr.toLowerCase().indexOf('patch') >= 0) {
+            add(id, titleStr, catStr, label, dateStr);
+          }
+        }
+      } catch (e) {}
+
+      const keys = Object.keys(cur);
+      for (let i = 0; i < keys.length; i++) {
+        try { stack.push(cur[keys[i]]); } catch (e) {}
+      }
+
+      if (limit && out.length >= limit) break;
+      continue;
+    }
+
+    if (t === 'string') {
+      // ignore
+      continue;
+    }
+  }
+
+  out.sort((a, b) => (b.score || 0) - (a.score || 0));
+  if (limit && out.length > limit) return out.slice(0, limit);
+  return out;
+}
+
 
 function scoreByContext(html, idx) {
   if (!html || idx == null) return 0;
@@ -1214,30 +1348,45 @@ function scoreByContext(html, idx) {
 }
 
 function pushCandidate(out, url, baseUrl, html, idx) {
-  const raw = decodeHtmlEntities(String(url || '').trim());
+  if (!url) return;
+
+  const raw = String(url).trim();
   if (!raw) return;
 
-  const abs = resolveUrl(baseUrl, raw);
+  // 목록 페이지 쿼리 자체는 제외(예: ?category=patch_notes&...)
+  if (raw.indexOf('?') >= 0) return;
 
-  // 이미지/리소스 제외
-  if (/\.(jpg|jpeg|png|webp|gif|svg)(\?|#|$)/i.test(abs)) return;
+  if (raw.indexOf('/news/') < 0) return;
 
-  // 뉴스 경로만
-  if (abs.indexOf('/news/') < 0) return;
+  let abs = resolveUrl(baseUrl, raw);
+  if (!abs) return;
+
+  // locale(/ko, /en 등) 강제 + origin 통일
+  abs = normalizeNewsUrlToLocale(abs, baseUrl);
+
+  // media 직접 링크 제외
+  if (/\.(png|jpe?g|gif|webp|svg)(?:[?#]|$)/i.test(abs)) return;
 
   const id = parseNewsIdFromUrl(abs);
+  if (!id) return;
+
   const score = scoreByContext(html, idx);
 
-  // 중복 제거
+  // id 기준 중복 제거(서브도메인/로케일 차이로 URL이 달라도 동일 글)
   for (let i = 0; i < out.length; i++) {
-    if (out[i] && String(out[i].url) === String(abs)) return;
+    if (out[i] && out[i].id === id) {
+      if (score > out[i].score) {
+        out[i].url = abs;
+        out[i].score = score;
+      }
+      return;
+    }
   }
 
   out.push({ url: abs, id: id, score: score });
 }
 
-// 목록 HTML에서 기사 URL 후보를 최대한 뽑아낸다.
-// - href / data-url / onclick / script 내 문자열 등 광범위 탐색
+
 function extractCandidateNewsUrlsFromHtml(listHtml, baseUrl) {
   const out = [];
   if (!listHtml) return out;
@@ -1270,30 +1419,79 @@ function extractCandidateNewsUrlsFromHtml(listHtml, baseUrl) {
     if (out.length >= 40) break;
   }
 
-  const reOnClick = /\bonclick\s*=\s*["'][^"']*(\/[a-z]{2}(?:-[a-z]{2})?\/news\/\d{3,10}[^"']*)["']/ig;
+  const reOnClick = /\bonclick\s*=\s*["'][^"']*(\/[a-z]{2}(?:-[a-z]{2})?\/news\/\d{3,7}[^"']*)["']/ig;
   while ((m = reOnClick.exec(html)) !== null) {
     const v2 = m[1];
     if (!v2) continue;
     pushCandidate(out, v2, baseUrl, html, m.index);
     if (out.length >= 40) break;
   }
+  // 2.5) __NEXT_DATA__ JSON 스캔: 리스트 HTML에 href가 없고 ID만 들어있는 경우 대비
+  try {
+    const nextObj = extractNextDataJson(listHtml);
+    if (nextObj) {
+      // (a) 문자열 중 /news/#### 경로 추출
+      const stack = [nextObj];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (!cur) continue;
+
+        if (Array.isArray(cur)) {
+          for (let i = 0; i < cur.length; i++) stack.push(cur[i]);
+          continue;
+        }
+
+        const t = typeof cur;
+        if (t === 'string') {
+          const s = cur;
+          if (s.indexOf('/news/') >= 0) {
+            const rePath = /\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?news\/\d{3,7}(?:[/?#]|$)/ig;
+            let mm;
+            while ((mm = rePath.exec(s)) != null) {
+              pushCandidate(out, mm[0], baseUrl, listHtml, 0);
+            }
+          }
+          continue;
+        }
+
+        if (t === 'object') {
+          const keys = Object.keys(cur);
+          for (let i = 0; i < keys.length; i++) {
+            try { stack.push(cur[keys[i]]); } catch (e) {}
+          }
+          continue;
+        }
+      }
+
+      // (b) 오브젝트 후보 수집 -> id로 URL 생성
+      const objCandidates = collectPatchNewsObjectsFromNextData(nextObj, 20);
+      for (let i = 0; i < objCandidates.length; i++) {
+        const c = objCandidates[i];
+        const u = buildNewsUrlForId(baseUrl, c.id);
+        if (!u) continue;
+        pushCandidate(out, u, baseUrl, listHtml, 0);
+        if (out.length >= 30) break;
+      }
+    }
+  } catch (e) {}
+
 
   // 3) HTML 전체에서 /<locale>/news/<id> 패턴 스캔 (script 포함)
-  const reLocalePath = /\/[a-z]{2}(?:-[a-z]{2})?\/news\/\d{3,10}(?:\?[^"'\s<]*)?/ig;
+  const reLocalePath = /\/[a-z]{2}(?:-[a-z]{2})?\/news\/\d{3,7}(?:\?[^"'\s<]*)?/ig;
   while ((m = reLocalePath.exec(html)) !== null) {
     pushCandidate(out, m[0], baseUrl, html, m.index);
     if (out.length >= 60) break;
   }
 
   // 4) /news/<id> 패턴 스캔 (locale 없는 케이스)
-  const rePlainPath = /\/news\/\d{3,10}(?:\?[^"'\s<]*)?/ig;
+  const rePlainPath = /\/news\/\d{3,7}(?:\?[^"'\s<]*)?/ig;
   while ((m = rePlainPath.exec(html)) !== null) {
     pushCandidate(out, m[0], baseUrl, html, m.index);
     if (out.length >= 80) break;
   }
 
   // 5) 절대 URL 패턴 스캔
-  const reAbs = /https?:\/\/(?:www\.)?pubg\.com\/[a-z]{2}(?:-[a-z]{2})?\/news\/\d{3,10}(?:\?[^"'\s<]*)?/ig;
+  const reAbs = /https?:\/\/(?:www\.)?pubg\.com\/[a-z]{2}(?:-[a-z]{2})?\/news\/\d{3,7}(?:\?[^"'\s<]*)?/ig;
   while ((m = reAbs.exec(html)) !== null) {
     pushCandidate(out, m[0], baseUrl, html, m.index);
     if (out.length >= 80) break;
