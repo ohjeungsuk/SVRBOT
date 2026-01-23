@@ -655,6 +655,7 @@ async function handleAiChat(message) {
     '대답은 짧고 자연스럽게 한다. ' +
     '이름은 리터 라고 한다. ' +
     '나이는 20살이다 ' +
+    '너는 MBTI가INFP다 ' +
     '과한 설명은 하지 않는다. ' +
     '모르는 내용은 모른다고 말한다.';
 
@@ -688,7 +689,7 @@ async function handleAiChat(message) {
 }
 
 // ---- PUBG Patch Notes Helper Functions ----
-const PUBG_PATCH_LIST_URL = 'https://pubg.com/ko/news?category=patch_notes';
+const PUBG_PATCH_LIST_URL = 'https://pubg.com/ko/news?category=patch_notes&label=label_pc&page=1&size=10';
 const PUBG_HTTP_TIMEOUT_MS = 25000;
 const PUBG_MAX_HTML_BYTES = 6 * 1024 * 1024; // 6MB
 const PUBG_CACHE_TTL_MS = 10 * 60 * 1000;    // 10 minutes
@@ -885,25 +886,75 @@ function extractCandidateNewsUrlsFromHtml(listHtml, baseUrl) {
   const urls = [];
   if (!listHtml) return urls;
 
-  // 1) href based
+  const html = String(listHtml || '');
+
+  function normalizeFoundUrl(s) {
+    let p = String(s || '').trim();
+    if (!p) return '';
+    // common JSON escapes seen in inline scripts
+    p = p.replace(/\\u0026/g, '&');
+    p = p.replace(/\\\//g, '/');
+    p = p.replace(/\\\?/g, '?');
+    return p;
+  }
+
+  function extractNewsId(u) {
+    const mm = String(u || '').match(/\/ko\/news\/(\d+)/i);
+    if (!mm) return 0;
+    const n = parseInt(mm[1], 10);
+    return isNaN(n) ? 0 : n;
+  }
+
+  // 1) href based (works when anchors exist)
   const reHref = /href\s*=\s*["']([^"']+)["']/ig;
   let m;
-  while ((m = reHref.exec(String(listHtml))) !== null) {
-    const href = String(m[1] || '');
+  while ((m = reHref.exec(html)) !== null) {
+    const href = normalizeFoundUrl(m[1]);
     if (!href) continue;
 
     // expect: /ko/news/<id>...
     if (href.indexOf('/ko/news/') < 0) continue;
+
+    // ignore list page itself
     if (href.indexOf('/ko/news?') >= 0) continue;
 
     const abs = resolveUrl(baseUrl, href);
     uniquePush(urls, abs);
-    if (urls.length >= 20) break;
+    if (urls.length >= 40) break;
   }
 
-  // 2) fallback: __NEXT_DATA__ json
+  // 2) Robust scan: SPA pages often store the article URL in onclick/json, not href
+  //   - /ko/news/9002?category=patch_notes
+  //   - \/ko\/news\/9002?category=patch_notes  (escaped)
+  //   - https:\/\/pubg.com\/ko\/news\/9002     (escaped full url)
+  if (urls.length < 5) {
+    const patterns = [
+      /\/ko\/news\/\d+(?:\?[^"'\\s<>]+)?/ig,
+      /\\\/ko\\\/news\\\/\d+(?:\\\?[^"'\\s<>]+)?/ig,
+      /https?:\/\/pubg\.com\/ko\/news\/\d+(?:\?[^"'\\s<>]+)?/ig,
+      /https?:\\\/\\\/pubg\.com\\\/ko\\\/news\\\/\d+(?:\\\?[^"'\\s<>]+)?/ig,
+    ];
+
+    for (let pi = 0; pi < patterns.length; pi++) {
+      const reAny = patterns[pi];
+      reAny.lastIndex = 0;
+      while ((m = reAny.exec(html)) !== null) {
+        const raw = normalizeFoundUrl(m[0]);
+        if (!raw) continue;
+
+        // make it absolute
+        const abs = resolveUrl(baseUrl, raw);
+        uniquePush(urls, abs);
+
+        if (urls.length >= 40) break;
+      }
+      if (urls.length >= 40) break;
+    }
+  }
+
+  // 3) fallback: __NEXT_DATA__ json (if present)
   if (urls.length === 0) {
-    const mNext = String(listHtml).match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+    const mNext = html.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
     if (mNext && mNext[1]) {
       try {
         const obj = JSON.parse(mNext[1]);
@@ -911,8 +962,9 @@ function extractCandidateNewsUrlsFromHtml(listHtml, baseUrl) {
         (function walk(v) {
           if (!v) return;
           if (typeof v === 'string') {
-            if (v.indexOf('/ko/news/') >= 0 && v.indexOf('/ko/news?') < 0) {
-              uniquePush(found, resolveUrl(baseUrl, v));
+            const s = normalizeFoundUrl(v);
+            if (s.indexOf('/ko/news/') >= 0 && s.indexOf('/ko/news?') < 0) {
+              uniquePush(found, resolveUrl(baseUrl, s));
             }
             return;
           }
@@ -925,13 +977,24 @@ function extractCandidateNewsUrlsFromHtml(listHtml, baseUrl) {
             for (let i = 0; i < keys.length; i++) walk(v[keys[i]]);
           }
         })(obj);
+
         for (let i = 0; i < found.length; i++) {
           uniquePush(urls, found[i]);
-          if (urls.length >= 20) break;
+          if (urls.length >= 40) break;
         }
       } catch (e) {}
     }
   }
+
+  // 4) "최신" 우선: 숫자 뉴스ID 기준 내림차순 정렬
+  urls.sort((a, b) => {
+    const ia = extractNewsId(a);
+    const ib = extractNewsId(b);
+    if (ia && ib) return ib - ia;
+    if (ib) return 1;
+    if (ia) return -1;
+    return 0;
+  });
 
   return urls;
 }
@@ -1024,7 +1087,9 @@ async function fetchLatestPubgPatchNote(options) {
   }
 
   const listRes = await fetchHtml(PUBG_PATCH_LIST_URL, PUBG_HTTP_TIMEOUT_MS);
-  if (!listRes || !listRes.ok) throw new Error('PUBG list fetch failed');
+  if (!listRes || !listRes.ok || (listRes.statusCode && listRes.statusCode >= 400)) {
+    throw new Error('PUBG list fetch failed: HTTP ' + (listRes && listRes.statusCode ? listRes.statusCode : '0'));
+  }
 
   const listHtml = listRes.html || '';
   const candidates = extractCandidateNewsUrlsFromHtml(listHtml, listRes.url || PUBG_PATCH_LIST_URL);
@@ -1035,7 +1100,9 @@ async function fetchLatestPubgPatchNote(options) {
   const latestUrl = candidates[0];
 
   const articleRes = await fetchHtml(latestUrl, PUBG_HTTP_TIMEOUT_MS);
-  if (!articleRes || !articleRes.ok) throw new Error('PUBG article fetch failed');
+  if (!articleRes || !articleRes.ok || (articleRes.statusCode && articleRes.statusCode >= 400)) {
+    throw new Error('PUBG article fetch failed: HTTP ' + (articleRes && articleRes.statusCode ? articleRes.statusCode : '0'));
+  }
 
   const parsed = parsePatchNoteFromArticle(articleRes.html || '', articleRes.url || latestUrl);
 
