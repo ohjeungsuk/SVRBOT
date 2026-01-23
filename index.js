@@ -1,4 +1,4 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger + GPT API via OpenAI Responses + !복귀 + PartyBeast room renumber + PUBG Patch Notes)
+// index.js (discord.js v12.5.3 + Google Sheets logger + GPT API via OpenAI Responses + !복귀 + PartyBeast room renumber )
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
@@ -13,14 +13,13 @@
 const Discord = require('discord.js');
 const { google } = require('googleapis');
 const https = require('https');
-const zlib = require('zlib');
-
 const client = new Discord.Client({
   partials: ['MESSAGE', 'CHANNEL', 'REACTION'],
 });
 
 const prefix = '!';
-let latestTeams = [];
+let latestTeams = []; // [[memberId...], ...]
+let latestTeamsMeta = { guildId: '', textChannelId: '', voiceChannelId: '', createdAtMs: 0 };
 
 // ---- OpenAI Settings ----
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
@@ -44,6 +43,13 @@ const BACKUP_MAX_MESSAGES = 20000;
 const WAITING_ROOM_VOICE_ID = '1453266042439860224';
 const lastDisbandedMemberIds = new Set(); // !해산으로 이동된 사람 id 저장
 
+// ---- 팀/해산/나눠 명령 채널/파티생성 기준 ----
+// !나눠는 아래 텍스트 채널에서만 동작하도록 제한한다.
+const TEAM_COMMAND_TEXT_CHANNEL_ID = '1442821423495254037';
+// 파티비스트의 "파티 생성" 채널(또는 그와 동일 카테고리) 기준으로 방을 만든다.
+// 이 채널이 카테고리 아래에 있다면, 해당 카테고리에 방을 생성한다.
+const PARTY_CREATE_CHANNEL_ID = '1453251022746030273';
+
 // ---- PartyBeast Room Renumber Settings ----
 const REN_NUMBER_DELAY_MS = 2000;      // 파티비스트 생성/삭제 이후 기다리는 시간
 const REN_RENAME_GAP_MS = 700;         // rename 연속 호출 간 간격(레이트리밋 완화)
@@ -62,6 +68,26 @@ for (let i = 0; i < MANAGED_ROOM_CATEGORIES.length; i++) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isAdminMember(member) {
+  if (!member || !member.hasPermission) return false;
+  try { return member.hasPermission('ADMINISTRATOR'); } catch (e) { return false; }
+}
+
+function isTeamCommandTextChannel(message) {
+  if (!message || !message.channel) return false;
+  return String(message.channel.id) === String(TEAM_COMMAND_TEXT_CHANNEL_ID);
+}
+
+function getUserNicknameOnly(message) {
+  // 서버 닉네임이 "닉네임/년생/배그닉" 형태일 때, 닉네임만 추출
+  if (!message) return 'User';
+  const display = (message.member && message.member.displayName) ? String(message.member.displayName) : (message.author ? String(message.author.username) : '');
+  if (!display) return 'User';
+  const first = String(display).split('/')[0];
+  const nick = String(first || '').trim();
+  return nick ? nick : String(display).trim();
 }
 
 // 팀 셔플용: Fisher–Yates 셔플 (기존 sort(Math.random)보다 훨씬 랜덤성 좋음)
@@ -376,19 +402,45 @@ async function fetchAllMessagesFromChannelText(channel) {
 }
 
 async function runBackup(invokingMessage) {
+  // 백업 결과는 기본적으로 "명령어를 친 사람"에게만 DM으로 알린다.
+  // 일반 메시지 기반 명령어는 'ephemeral(사용자에게만 보이기)'가 불가능하므로,
+  // DM이 막힌 경우에만 채널에 잠깐 표시 후 삭제한다.
+  async function notify(text) {
+    if (!invokingMessage || !invokingMessage.author) return;
+
+    try {
+      await invokingMessage.author.send(String(text));
+      return;
+    } catch (e) {
+      // DM 불가: 채널에 임시 표시 후 삭제(가능하면)
+      try {
+        const tmp = await invokingMessage.reply(String(text) + '\n(DM 수신이 차단되어 채널에 잠깐 표시됩니다.)');
+        if (tmp && tmp.delete) {
+          setTimeout(() => {
+            try { tmp.delete(); } catch (ee) {}
+          }, 8000);
+        }
+      } catch (ee2) {}
+    }
+  }
+
+  // 명령 메시지는 정리(가능하면)
+  try { await invokingMessage.delete(); } catch (e) {}
+
   if (backupRunning) {
-    try { await invokingMessage.reply('이미 백업 진행중이야. 끝나면 다시 시도해줘.'); } catch (e) {}
+    await notify('이미 백업 진행중입니다. 끝난 뒤 다시 시도해 주세요.');
     return;
   }
 
   backupRunning = true;
   try {
+    await notify('백업을 시작합니다.');
     await initSheets();
 
     const ch = await getOrFetchChannel(TARGET_CHANNEL_ID);
     if (!ch || ch.type !== 'text') {
       console.error('[Backup] target channel not found or not text:', TARGET_CHANNEL_ID);
-      try { await invokingMessage.reply('백업 실패: 채널을 못 찾았거나 텍스트 채널이 아님.'); } catch (e) {}
+      await notify('백업 실패: 대상 채널을 찾지 못했거나 텍스트 채널이 아닙니다.');
       return;
     }
 
@@ -406,7 +458,7 @@ async function runBackup(invokingMessage) {
 
     const msgs = await fetchAllMessagesFromChannelText(ch);
     if (!msgs || msgs.length === 0) {
-      try { await invokingMessage.reply('백업 완료(0건). 새 시트: ' + newTitle); } catch (e) {}
+      await notify('백업 완료(0건). 새 시트: ' + newTitle);
       return;
     }
 
@@ -431,7 +483,7 @@ async function runBackup(invokingMessage) {
 
     if (rows.length === 0) {
       console.log('[Backup] no matched leave-form messages');
-      try { await invokingMessage.reply('백업 완료(양식 0건). 새 시트: ' + newTitle); } catch (e) {}
+      await notify('백업 완료(양식 0건). 새 시트: ' + newTitle);
       return;
     }
 
@@ -443,13 +495,11 @@ async function runBackup(invokingMessage) {
     }
 
     console.log('[Backup] done. sheet:', newTitle, 'matched:', rows.length);
+    await notify('백업 완료: 양식 ' + rows.length + '건, 새 시트: ' + newTitle);
 
-    try {
-      await invokingMessage.reply('백업 완료: 양식 ' + rows.length + '건, 새 시트: ' + newTitle);
-    } catch (e) {}
   } catch (e) {
     console.error('[Backup] failed:', e && e.stack ? e.stack : e);
-    try { await invokingMessage.reply('백업 실패. Heroku 로그 확인해줘.'); } catch (ee) {}
+    await notify('백업 실패. Heroku 로그를 확인해 주세요.');
   } finally {
     backupRunning = false;
   }
@@ -648,6 +698,8 @@ async function handleAiChat(message) {
   const raw = String(message.content).trim();
   if (!raw) return;
 
+  const userNick = getUserNicknameOnly(message);
+
   const history = trimHistory(getHistoryFor(message));
 
   const instructionText =
@@ -662,12 +714,18 @@ async function handleAiChat(message) {
   for (let i = 0; i < history.length; i++) {
     const it = history[i];
     if (!it || !it.role) continue;
-    const role = it.role === 'user' ? 'User' : 'Assistant';
-    prompt += role + ': ' + String(it.text || '') + '\n';
-  }
-  prompt += 'User: ' + raw + '\nAssistant:';
 
-  history.push({ role: 'user', text: raw });
+    if (it.role === 'user') {
+      const nm = it.name ? String(it.name) : '';
+      const head = nm ? ('User(' + nm + '): ') : 'User: ';
+      prompt += head + String(it.text || '') + '\n';
+    } else {
+      prompt += 'Assistant: ' + String(it.text || '') + '\n';
+    }
+  }
+  prompt += 'User(' + userNick + '): ' + raw + '\nAssistant:';
+
+  history.push({ role: 'user', name: userNick, text: raw });
   setHistoryFor(message, trimHistory(history));
 
   const result = await callOpenAIResponses(instructionText, prompt);
@@ -687,492 +745,6 @@ async function handleAiChat(message) {
   await sendLongText(message.channel, out);
 }
 
-// ---- PUBG Patch Notes Helper Functions (RSS) ----
-// 목표: "RSS 피드"에서 PUBG 최신 패치노트 글을 찾아 본문을 추출(가능하면 한국어)하고,
-// !배그패치 명령으로 요약 + 발췌/원문을 디스코드에 출력한다.
-//
-// 기본 구현: Steam 공식 RSS(앱 578080) 사용
-// - 장점: React/Next 렌더링 의존 없음, 서버에서 바로 XML을 받을 수 있어 안정적
-// - 기본 RSS URL(한국어): https://store.steampowered.com/feeds/news/app/578080/?cc=KR&l=koreana
-//
-// Optional env:
-// - PUBG_PATCH_RSS_URL : 다른 RSS URL로 교체 가능
-// - PUBG_DEBUG=1       : 후보 선택/파싱 로그 출력
-//
-// 주의:
-// - RSS의 description/content에 본문이 모두 들어오는 경우가 많지만, 일부 항목은 요약만 있을 수 있다.
-//   그런 경우엔 링크 페이지 HTML을 추가로 시도하여 본문을 보강한다(성공하면).
-
-const PUBG_PATCH_RSS_URL = process.env.PUBG_PATCH_RSS_URL ||
-  'https://store.steampowered.com/feeds/news/app/578080/?cc=KR&l=koreana';
-
-const PUBG_HTTP_TIMEOUT_MS = 25000;
-const PUBG_MAX_TEXT_BYTES = 8 * 1024 * 1024; // 8MB
-const PUBG_CACHE_TTL_MS = 10 * 60 * 1000;    // 10 minutes
-
-const PUBG_DEFAULT_EXCERPT_CHARS = 4500;     // 기본 발췌 길이
-const PUBG_FULL_EXCERPT_CHARS = 15000;       // 전체 모드 최대
-
-const PUBG_DEBUG = String(process.env.PUBG_DEBUG || '') === '1';
-
-const pubgPatchCache = {
-  key: '',
-  fetchedAtMs: 0,
-  data: null,
-};
-
-const pubgHttpCache = new Map(); // url -> { atMs, finalUrl, statusCode, text, headers }
-
-function pubgLog() {
-  if (!PUBG_DEBUG) return;
-  try { console.log.apply(console, arguments); } catch (e) {}
-}
-
-function pubgNowMs() {
-  return new Date().getTime();
-}
-
-function pubgResolveUrl(base, href) {
-  try { return new URL(String(href), String(base)).toString(); } catch (e) { return String(href || ''); }
-}
-
-function pubgDecodeHtmlEntities(s) {
-  if (!s) return '';
-  return String(s)
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'");
-}
-
-function pubgStripTagsToText(html) {
-  if (!html) return '';
-  let s = String(html);
-
-  s = s.replace(/<script[\s\S]*?<\/script>/gi, ' ');
-  s = s.replace(/<style[\s\S]*?<\/style>/gi, ' ');
-  s = s.replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ');
-  s = s.replace(/<svg[\s\S]*?<\/svg>/gi, ' ');
-
-  s = s.replace(/<br\s*\/?>/gi, '\n');
-  s = s.replace(/<\/p\s*>/gi, '\n\n');
-  s = s.replace(/<\/h[1-6]\s*>/gi, '\n\n');
-  s = s.replace(/<\/div\s*>/gi, '\n');
-  s = s.replace(/<li[^>]*>/gi, '- ');
-  s = s.replace(/<\/li\s*>/gi, '\n');
-
-  s = s.replace(/<[^>]+>/g, ' ');
-
-  s = pubgDecodeHtmlEntities(s);
-
-  s = s.replace(/\r/g, '');
-  s = s.replace(/[ \t]+\n/g, '\n');
-  s = s.replace(/\n{3,}/g, '\n\n');
-  s = s.replace(/[ \t]{2,}/g, ' ');
-  return s.trim();
-}
-
-function pubgGunzipIfNeeded(buf, encoding, cb) {
-  const enc = String(encoding || '').toLowerCase();
-  if (enc === 'gzip') { zlib.gunzip(buf, cb); return; }
-  if (enc === 'deflate') { zlib.inflate(buf, cb); return; }
-  if (enc === 'br') {
-    if (zlib.brotliDecompress) { zlib.brotliDecompress(buf, cb); return; }
-  }
-  cb(null, buf);
-}
-
-function fetchTextRaw(url, timeoutMs, acceptHeader) {
-  return new Promise((resolve, reject) => {
-    const maxRedirects = 5;
-
-    function go(u, redirectsLeft) {
-      let urlObj;
-      try { urlObj = new URL(String(u)); } catch (e) { reject(e); return; }
-
-      const req = https.request(
-        {
-          protocol: urlObj.protocol,
-          hostname: urlObj.hostname,
-          path: urlObj.pathname + urlObj.search,
-          method: 'GET',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': acceptHeader || 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-          },
-          timeout: timeoutMs || PUBG_HTTP_TIMEOUT_MS,
-        },
-        (res) => {
-          if (!res) { reject(new Error('no response')); return; }
-
-          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers && res.headers.location && redirectsLeft > 0) {
-            const nextUrl = pubgResolveUrl(u, res.headers.location);
-            res.resume();
-            go(nextUrl, redirectsLeft - 1);
-            return;
-          }
-
-          const chunks = [];
-          let total = 0;
-
-          res.on('data', (chunk) => {
-            if (!chunk) return;
-            total += chunk.length || 0;
-            if (total > PUBG_MAX_TEXT_BYTES) {
-              try { req.destroy(new Error('response too large')); } catch (e) {}
-              return;
-            }
-            chunks.push(chunk);
-          });
-
-          res.on('end', () => {
-            const buf = Buffer.concat(chunks);
-            const enc = res.headers ? res.headers['content-encoding'] : '';
-            pubgGunzipIfNeeded(buf, enc, (err, outBuf) => {
-              if (err) { reject(err); return; }
-              const text = outBuf.toString('utf8');
-              resolve({ ok: true, url: String(u), finalUrl: String(u), statusCode: res.statusCode, text: text, headers: res.headers || {} });
-            });
-          });
-
-          res.on('error', (e) => reject(e));
-        }
-      );
-
-      req.on('timeout', () => {
-        try { req.destroy(new Error('timeout')); } catch (e) {}
-        reject(new Error('timeout'));
-      });
-
-      req.on('error', (e) => reject(e));
-      req.end();
-    }
-
-    go(String(url), maxRedirects);
-  });
-}
-
-async function fetchTextWithCache(url, timeoutMs, acceptHeader) {
-  const u = String(url || '');
-  const now = pubgNowMs();
-
-  const cached = pubgHttpCache.get(u);
-  if (cached && cached.atMs && (now - cached.atMs) < PUBG_CACHE_TTL_MS && cached.text) {
-    return cached;
-  }
-
-  const res = await fetchTextRaw(u, timeoutMs || PUBG_HTTP_TIMEOUT_MS, acceptHeader);
-  if (!res || !res.ok) throw new Error('fetch failed');
-
-  const obj = { atMs: now, finalUrl: res.finalUrl || u, statusCode: res.statusCode || 0, text: res.text || '', headers: res.headers || {} };
-  pubgHttpCache.set(u, obj);
-  return obj;
-}
-
-function pubgXmlUnwrap(s) {
-  if (!s) return '';
-  let t = String(s);
-  // CDATA
-  t = t.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '');
-  // trim
-  return t.trim();
-}
-
-function pubgXmlGetFirst(xml, tagName) {
-  const re = new RegExp('<' + tagName + '\\b[^>]*>([\\s\\S]*?)<\\/' + tagName + '>', 'i');
-  const m = String(xml || '').match(re);
-  return m && m[1] ? pubgXmlUnwrap(m[1]) : '';
-}
-
-function pubgXmlGetAllItems(xml) {
-  const out = [];
-  const re = /<item\b[^>]*>([\s\S]*?)<\/item>/ig;
-  let m;
-  while ((m = re.exec(String(xml || ''))) !== null) {
-    const block = m[1] || '';
-    const title = pubgDecodeHtmlEntities(pubgXmlGetFirst(block, 'title'));
-    const link = pubgXmlGetFirst(block, 'link');
-    const pubDate = pubgXmlGetFirst(block, 'pubDate');
-    const guid = pubgXmlGetFirst(block, 'guid');
-    const desc = pubgXmlGetFirst(block, 'description');
-    const content = pubgXmlGetFirst(block, 'content:encoded');
-
-    // Steam RSS는 description이 CDATA HTML일 때가 많음
-    const rawHtml = content || desc || '';
-
-    // 이미지: enclosure / media:content / img 태그 등
-    let imageUrl = '';
-    const mEnc = block.match(/<enclosure[^>]+url=["']([^"']+)["'][^>]*>/i);
-    if (mEnc && mEnc[1]) imageUrl = String(mEnc[1]).trim();
-
-    const mMedia = block.match(/<media:content[^>]+url=["']([^"']+)["'][^>]*>/i);
-    if (!imageUrl && mMedia && mMedia[1]) imageUrl = String(mMedia[1]).trim();
-
-    // img tag in description
-    if (!imageUrl && rawHtml) {
-      const mi = String(rawHtml).match(/<img[^>]+src=["']([^"']+)["']/i);
-      if (mi && mi[1]) imageUrl = String(mi[1]).trim();
-    }
-
-    out.push({
-      title: title,
-      link: String(link || '').trim(),
-      pubDate: String(pubDate || '').trim(),
-      guid: String(guid || '').trim(),
-      rawHtml: String(rawHtml || ''),
-      imageUrl: imageUrl ? pubgDecodeHtmlEntities(imageUrl) : '',
-    });
-
-    if (out.length >= 40) break;
-  }
-  return out;
-}
-
-function pubgScoreRssItem(it) {
-  const t = String(it.title || '').toLowerCase();
-  const h = String(it.rawHtml || '').toLowerCase();
-
-  let score = 0;
-  if (t.indexOf('patch') >= 0) score += 50;
-  if (t.indexOf('패치') >= 0) score += 60;
-  if (t.indexOf('업데이트') >= 0) score += 35;
-
-  if (h.indexOf('patch notes') >= 0) score += 30;
-  if (h.indexOf('패치 노트') >= 0) score += 40;
-  if (h.indexOf('업데이트') >= 0) score += 15;
-
-  // 제재/공지/이벤트는 패치노트가 아닐 확률이 높음
-  if (t.indexOf('제재') >= 0 || t.indexOf('sanction') >= 0 || t.indexOf('ban') >= 0) score -= 70;
-  if (t.indexOf('공지') >= 0 || t.indexOf('announcement') >= 0 || t.indexOf('notice') >= 0) score -= 40;
-  if (t.indexOf('이벤트') >= 0 || t.indexOf('event') >= 0) score -= 30;
-
-  // 링크가 없으면 감점
-  if (!it.link) score -= 50;
-
-  return score;
-}
-
-function pubgExtractBestBodyTextFromRssItem(it) {
-  const html = String(it.rawHtml || '');
-  const text = pubgStripTagsToText(html);
-  return text;
-}
-
-function pubgExtractMainBodyFromSteamNewsHtml(fullHtml) {
-  if (!fullHtml) return '';
-
-  const html = String(fullHtml);
-
-  // Steam News 본문 컨테이너 후보들
-  const candidates = [
-    /<div[^>]+class=["'][^"']*(?:event_description|event_desc|eventcontent|post_body|announcement_body|bodytext|bbcode)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i,
-    /<div[^>]+id=["']newsContent["'][^>]*>([\s\S]*?)<\/div>/i,
-    /<div[^>]+id=["']apphub_CardTextContent["'][^>]*>([\s\S]*?)<\/div>/i,
-  ];
-
-  let best = '';
-  for (let i = 0; i < candidates.length; i++) {
-    const m = html.match(candidates[i]);
-    if (m && m[1] && String(m[1]).length > best.length) best = String(m[1]);
-  }
-
-  if (best && best.length > 400) return best;
-
-  // fallback: article/main
-  const mArticle = html.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
-  if (mArticle && mArticle[1]) return String(mArticle[1]);
-
-  const mMain = html.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
-  if (mMain && mMain[1]) return String(mMain[1]);
-
-  return html;
-}
-
-function pubgExtractUrlsByTagAttr(html, tagName, attrName, baseUrl, maxCount) {
-  const out = [];
-  if (!html) return out;
-
-  const re = new RegExp('<' + tagName + '\\b[^>]*\\b' + attrName + '\\s*=\\s*["\\\']([^"\\\']+)["\\\']', 'ig');
-  let m;
-  while ((m = re.exec(String(html))) !== null) {
-    const href = m[1];
-    const abs = pubgResolveUrl(baseUrl, href);
-    if (abs.indexOf('data:') === 0) continue;
-    if (abs.toLowerCase().indexOf('.svg') >= 0) continue;
-    const s = String(abs).trim();
-    if (!s) continue;
-    if (out.indexOf(s) >= 0) continue;
-    out.push(s);
-    if (maxCount && out.length >= maxCount) break;
-  }
-  return out;
-}
-
-async function fetchLatestPubgPatchNote(options) {
-  const opt = options || {};
-  const wantChars = opt.maxChars && !isNaN(opt.maxChars) ? parseInt(opt.maxChars, 10) : PUBG_DEFAULT_EXCERPT_CHARS;
-
-  const cacheKey = 'rss_patch_' + String(wantChars);
-  const now = pubgNowMs();
-  if (pubgPatchCache.data && pubgPatchCache.key === cacheKey && pubgPatchCache.fetchedAtMs && (now - pubgPatchCache.fetchedAtMs) < PUBG_CACHE_TTL_MS) {
-    return pubgPatchCache.data;
-  }
-
-  // 1) RSS 가져오기
-  const rssRes = await fetchTextWithCache(PUBG_PATCH_RSS_URL, PUBG_HTTP_TIMEOUT_MS, 'application/rss+xml,application/xml;q=0.9,text/xml;q=0.8,*/*;q=0.7');
-  const rssXml = rssRes && rssRes.text ? rssRes.text : '';
-  if (!rssXml || rssXml.length < 200) throw new Error('PUBG RSS fetch failed');
-
-  const items = pubgXmlGetAllItems(rssXml);
-  if (!items || items.length === 0) throw new Error('PUBG RSS has no items');
-
-  // 2) 패치노트 후보 선택(점수 기반)
-  let best = null;
-  let bestScore = -999999;
-
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i];
-    const sc = pubgScoreRssItem(it);
-    pubgLog('rss_item[' + i + ']', 'score=' + sc, 'title=' + safeShort(it.title, 80), 'link=' + safeShort(it.link, 90));
-    if (sc > bestScore) {
-      bestScore = sc;
-      best = it;
-    }
-  }
-
-  if (!best || bestScore < 10) {
-    // 점수가 낮아도 최신글을 fallback으로 사용
-    best = items[0];
-    bestScore = pubgScoreRssItem(best);
-  }
-
-  if (!best || !best.link) throw new Error('PUBG patch link not found from RSS');
-
-  // 3) RSS 본문 텍스트 추출
-  let contentText = pubgExtractBestBodyTextFromRssItem(best);
-
-  // 4) 본문이 너무 짧으면 링크 페이지에서 보강 시도
-  let imageUrls = [];
-  let videoUrls = [];
-  let imageUrl = best.imageUrl ? pubgResolveUrl(best.link, best.imageUrl) : '';
-
-  if (best.rawHtml) {
-    imageUrls = pubgExtractUrlsByTagAttr(best.rawHtml, 'img', 'src', best.link, 8);
-    videoUrls = pubgExtractUrlsByTagAttr(best.rawHtml, 'iframe', 'src', best.link, 4);
-  }
-
-  if (!contentText || contentText.length < 1500) {
-    try {
-      const pageRes = await fetchTextWithCache(best.link, PUBG_HTTP_TIMEOUT_MS, 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8');
-      const fullHtml = pageRes && pageRes.text ? pageRes.text : '';
-      const bodyHtml = pubgExtractMainBodyFromSteamNewsHtml(fullHtml);
-      const pageText = pubgStripTagsToText(bodyHtml);
-
-      // 링크 페이지가 더 길면 교체
-      if (pageText && pageText.length > contentText.length) {
-        contentText = pageText;
-
-        // 이미지/영상 추가 보강
-        const imgs = pubgExtractUrlsByTagAttr(bodyHtml, 'img', 'src', best.link, 8);
-        for (let ii = 0; ii < imgs.length; ii++) if (imageUrls.indexOf(imgs[ii]) < 0) imageUrls.push(imgs[ii]);
-
-        const ifs = pubgExtractUrlsByTagAttr(bodyHtml, 'iframe', 'src', best.link, 4);
-        for (let vi = 0; vi < ifs.length; vi++) if (videoUrls.indexOf(ifs[vi]) < 0) videoUrls.push(ifs[vi]);
-
-        if (!imageUrl && imageUrls.length > 0) imageUrl = imageUrls[0];
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  const title = String(best.title || '').trim() || 'PUBG 패치노트';
-  const publishedText = String(best.pubDate || '').trim();
-
-  if (!contentText || contentText.length < 500) {
-    // 여기까지 왔는데도 본문이 없으면 실패로 판단
-    throw new Error('candidate not patch body');
-  }
-
-  // excerpt
-  let excerpt = contentText;
-  if (wantChars > 0 && excerpt.length > wantChars) excerpt = excerpt.slice(0, wantChars) + '\n\n(이하 생략)';
-
-  const out = {
-    title: title,
-    url: String(best.link),
-    publishedText: publishedText,
-    imageUrl: imageUrl,
-    imageUrls: imageUrls || [],
-    videoUrls: videoUrls || [],
-    contentText: contentText,
-    excerptText: excerpt,
-  };
-
-  pubgPatchCache.key = cacheKey;
-  pubgPatchCache.fetchedAtMs = pubgNowMs();
-  pubgPatchCache.data = out;
-
-  return out;
-}
-
-async function fetchLatestPubgPatchNoteSummary(options) {
-  const opt = options || {};
-  const wantFull = opt && opt.full === true;
-
-  const maxChars = wantFull ? PUBG_FULL_EXCERPT_CHARS : PUBG_DEFAULT_EXCERPT_CHARS;
-  const data = await fetchLatestPubgPatchNote({ maxChars: maxChars });
-
-  const rawText = String(data.contentText || '').trim();
-  const forAi = rawText.length > 6500 ? rawText.slice(0, 6500) : rawText;
-
-  let summaryText = '';
-
-  if (OPENAI_API_KEY) {
-    const instructionText =
-      '너는 PUBG 패치노트 요약 봇이다. ' +
-      '무조건 한국어로 답한다. ' +
-      '중요 변경점 위주로 짧고 정확하게 쓴다. ' +
-      '불릿 6~12개로 요약하고, 필요하면 섹션으로 나눠라.';
-
-    const prompt =
-      '아래는 PUBG 패치노트 원문(일부 또는 전체)이다.\n' +
-      '규칙:\n' +
-      '- 수치/밸런스/무기/맵/시스템/버그수정/신규콘텐츠를 가능하면 구분\n' +
-      '- 중요도 높은 것부터\n' +
-      '- 내용이 없으면 없다고 말해라(억지로 만들지 말 것)\n\n' +
-      forAi;
-
-    const aiResult = await callOpenAIResponses(instructionText, prompt);
-    if (aiResult && aiResult.ok && aiResult.text) summaryText = String(aiResult.text || '').trim();
-  }
-
-  if (!summaryText) {
-    // fallback: 발췌 앞부분
-    const fallback = rawText.length > 1200 ? rawText.slice(0, 1200) + '...' : rawText;
-    summaryText = fallback || '요약 실패';
-  }
-
-  return {
-    title: data.title,
-    url: data.url,
-    publishedText: data.publishedText,
-    imageUrl: data.imageUrl,
-    imageUrls: data.imageUrls,
-    videoUrls: data.videoUrls,
-    summary: summaryText,
-    excerptText: data.excerptText,
-    contentText: data.contentText,
-  };
-}
-// ---- End PUBG Patch Notes Helper Functions ----
 
 
 // ---- PartyBeast Room Renumber Implementation ----
@@ -1402,7 +974,7 @@ client.on('message', async (message) => {
   // AI 채널 인증
   if (command === '인증') {
     if (!message.guild) return;
-    if (!message.member || !message.member.hasPermission('ADMINISTRATOR')) {
+    if (!isAdminMember(message.member)) {
       try { await message.reply('권한이 없다.'); } catch (e) {}
       return;
     }
@@ -1418,83 +990,16 @@ client.on('message', async (message) => {
     return;
   }
 
-  // PUBG 최신 패치노트 요약
-      // PUBG 최신 패치노트 요약/원문 출력
     // 사용:
-    //  - !배그패치          : 요약 + 발췌
-    //  - !배그패치 전체     : 요약 + 더 긴 발췌
-    //  - !배그패치 원문     : 요약 + 원문(길면 일부만)
-    if (command === '배그패치') {
-      const wantFull = (args.indexOf('전체') >= 0);
-      const wantRaw = (args.indexOf('원문') >= 0);
 
-      try {
-        const result = await fetchLatestPubgPatchNoteSummary({ full: (wantFull || wantRaw) });
-
-        let msg = '';
-        msg += 'NEWS - PUBG: BATTLEGROUNDS\n';
-        msg += '요약\n';
-        msg += '## ' + (result.title || 'PUBG 패치노트') + '\n';
-        if (result.publishedText) msg += '(게시: ' + result.publishedText + ')\n';
-        msg += '\n' + (result.summary || '') + '\n\n';
-        msg += '자세히: ' + result.url + '\n';
-
-        await sendLongText(message.channel, msg);
-
-        // 이미지/영상 링크 (있으면)
-        const extraLinks = [];
-        if (result.imageUrl) extraLinks.push(result.imageUrl);
-
-        if (result.imageUrls && result.imageUrls.length > 0) {
-          for (let i = 0; i < result.imageUrls.length && extraLinks.length < 3; i++) {
-            const u = result.imageUrls[i];
-            if (u && extraLinks.indexOf(u) < 0) extraLinks.push(u);
-          }
-        }
-
-        if (result.videoUrls && result.videoUrls.length > 0) {
-          for (let j = 0; j < result.videoUrls.length && extraLinks.length < 5; j++) {
-            const v = result.videoUrls[j];
-            if (v && extraLinks.indexOf(v) < 0) extraLinks.push(v);
-          }
-        }
-
-        if (extraLinks.length > 0) {
-          let linkMsg = '추가 링크\n';
-          for (let k = 0; k < extraLinks.length; k++) linkMsg += extraLinks[k] + '\n';
-          await sendLongText(message.channel, linkMsg);
-        }
-
-        if (wantRaw) {
-          let body = String(result.contentText || '').trim();
-          if (!body) {
-            await message.channel.send('원문 추출 실패');
-            return;
-          }
-
-          // 디스코드 스팸 방지: 너무 길면 제한
-          if (body.length > 25000) {
-            body = body.slice(0, 25000) + '\n\n(원문이 너무 길어서 일부만 표시했습니다.)';
-          }
-
-          await sendLongText(message.channel, body);
-          return;
-        }
-
-        // 기본/전체는 발췌 출력
-        const excerpt = String(result.excerptText || '').trim();
-        if (excerpt) await sendLongText(message.channel, excerpt);
-        else await message.channel.send('발췌 내용이 없습니다.');
-
-      } catch (e) {
-        console.log('[PUBG_PATCH_ERROR]', e && e.stack ? e.stack : e);
-        await message.channel.send('배그 패치노트를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
-      }
-      return;
-    }
 
   // !복귀: 마지막 !해산으로 이동된 인원들을 대기실로 이동
   if (command === '복귀') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
     if (!message.guild) return;
 
     const waiting = message.guild.channels.cache.get(WAITING_ROOM_VOICE_ID);
@@ -1530,6 +1035,17 @@ client.on('message', async (message) => {
   }
 
   if (command === '팀') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    if (!isTeamCommandTextChannel(message)) {
+      try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
+      return;
+    }
+
+
     const n = parseInt(args[0], 10);
     if (isNaN(n) || n < 1) {
       return message.reply('올바른 인원 수를 입력해주세요.');
@@ -1552,41 +1068,224 @@ client.on('message', async (message) => {
       return message.reply('음성 채널에 인원이 부족합니다.');
     }
 
-    // Fisher–Yates 셔플 사용
     const shuffledMembers = shuffleArray(members);
 
-    const teams = [];
+    // teamsMembers: GuildMember[][] (표시용), latestTeams: string[][] (ID 저장용)
+    const teamsMembers = [];
     let restMembers = shuffledMembers.length;
 
     while (restMembers > 0) {
       const teamSize = Math.min(restMembers, n);
-      const startIndex = teams.length * n;
+      const startIndex = teamsMembers.length * n;
       const teamMembers = shuffledMembers.slice(startIndex, startIndex + teamSize);
-      teams.push(teamMembers.map(member => member.displayName));
+      teamsMembers.push(teamMembers);
       restMembers -= teamSize;
     }
 
-    latestTeams = teams;
+    latestTeams = teamsMembers.map(team => team.map(m => String(m.id)));
+    latestTeamsMeta = {
+      guildId: String(message.guild.id),
+      textChannelId: String(message.channel.id),
+      voiceChannelId: String(voiceChannel.id),
+      createdAtMs: nowMs(),
+    };
 
-    const selectedTeamIndex = Math.floor(Math.random() * teams.length);
+    const selectedTeamIndex = Math.floor(Math.random() * teamsMembers.length);
     const selectedTeamName = (selectedTeamIndex + 1) + ' 팀';
     const randomMessage = selectedTeamName + '이 좀 치네...?';
 
     let teamMessage = '**새로운 팀이 구성되었습니다!**\n나와 함께 할 팀은???\n\n';
-    teams.forEach((team, i) => {
+    for (let i = 0; i < teamsMembers.length; i++) {
+      const team = teamsMembers[i];
       teamMessage += '```\nTeam ' + (i + 1) + '\n';
-      team.forEach(name => {
-        teamMessage += name + '\n';
-      });
+      for (let j = 0; j < team.length; j++) {
+        teamMessage += String(team[j].displayName) + '\n';
+      }
       teamMessage += '```\n';
-    });
+    }
 
-    message.channel.send(teamMessage);
-    message.channel.send(randomMessage);
+    // 랜덤 메시지는 팀표 아래에
+    teamMessage += '\n' + randomMessage + '\n';
+
+    await sendLongText(message.channel, teamMessage);
+
+    // 참가자 태그는 "마지막"에 별도 메시지로 보낸다(멘션이 잘리지 않게 배치 전송).
+    const mentions = members.map(m => '<@' + String(m.id) + '>').join(' ');
+    if (mentions) {
+      const tokens = mentions.split(' ').filter(Boolean);
+      const batchSize = 30;
+      let line = '참가자:';
+      for (let i = 0; i < tokens.length; i++) {
+        if ((i % batchSize) === 0 && i !== 0) {
+          await message.channel.send(line);
+          line = '참가자:';
+        }
+        line += ' ' + tokens[i];
+      }
+      if (line.trim() !== '참가자:') {
+        await message.channel.send(line);
+      }
+    }
     return;
   }
 
-  if (command === '해산') {
+  // !나눠: 지정 텍스트 채널에서 팀 결과 기준으로 일반방을 자동 생성 + 이동
+  // 제한:
+  // - 다른 봇(PartyBeast)의 "클릭"을 강제로 수행할 수는 없어서, 이 봇이 직접 음성 채널을 생성한다.
+  // - PARTY_CREATE_CHANNEL_ID가 카테고리 아래에 있다면, 그 카테고리에 방을 만든다.
+  if (command === '나눠') {
+    // 관리자만 가능
+    if (!message.guild) return;
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    // 지정된 텍스트 채널에서만 가능
+    if (!isTeamCommandTextChannel(message)) {
+      try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
+      return;
+    }
+
+    // 최근 팀 정보 확인
+    if (!latestTeams || latestTeams.length === 0 || !latestTeamsMeta) {
+      try { await message.reply('먼저 !팀 명령어로 팀을 구성해라.'); } catch (e) {}
+      return;
+    }
+
+    if (String(latestTeamsMeta.textChannelId || '') !== String(message.channel.id)) {
+      try { await message.reply('팀을 만든 채널과 다른 채널에서는 사용할 수 없다.'); } catch (e) {}
+      return;
+    }
+
+    // PartyBeast '파티생성' 허브 음성채널
+    const partyCreate = message.guild.channels.cache.get(String(PARTY_CREATE_CHANNEL_ID));
+    if (!partyCreate || partyCreate.type !== 'voice') {
+      try { await message.reply('나눠 실패: 파티생성 음성채널을 못 찾음.'); } catch (e) {}
+      return;
+    }
+
+    const categoryId = partyCreate.parentID ? String(partyCreate.parentID) : '';
+    if (!categoryId) {
+      try { await message.reply('나눠 실패: 파티생성 채널의 카테고리를 못 찾음.'); } catch (e) {}
+      return;
+    }
+
+    const cfg = managedCategoryMap.get(String(categoryId));
+    const prefixText = cfg && cfg.prefix ? String(cfg.prefix) : '';
+    const waitTimeoutMs = 15000;
+
+    // 채널 생성 감지용: 현재 카테고리 내 음성채널 ID 스냅샷
+    function snapshotVoiceIds() {
+      const ids = new Set();
+      const arr = message.guild.channels.cache
+        .filter((ch) => ch && ch.type === 'voice' && String(ch.parentID) === String(categoryId))
+        .array();
+      for (let i = 0; i < arr.length; i++) ids.add(String(arr[i].id));
+      return ids;
+    }
+
+    async function waitForNewRoom(knownIds) {
+      const started = new Date().getTime();
+      while (new Date().getTime() - started < waitTimeoutMs) {
+        const room = message.guild.channels.cache.find((ch) => {
+          if (!ch || ch.type !== 'voice') return false;
+          if (String(ch.parentID) !== String(categoryId)) return false;
+          if (knownIds.has(String(ch.id))) return false;
+          if (prefixText) {
+            if (String(ch.name || '').indexOf(prefixText) !== 0) return false;
+          }
+          return true;
+        });
+        if (room) return room;
+        await delay(300);
+      }
+      return null;
+    }
+
+    // 실제 동작: "클릭"은 불가. 대신 팀 대표 1명을 partyCreate로 이동시켜 '입장' 이벤트로 PartyBeast가 방을 만들게 한다.
+    // 각 팀별로 순차 처리하여 파티비스트/레이트리밋 충돌을 피한다.
+    const createdRoomIds = [];
+    lastDisbandedMemberIds.clear();
+
+    try {
+      for (let t = 0; t < latestTeams.length; t++) {
+        const team = latestTeams[t] || [];
+        if (!team || team.length === 0) continue;
+
+        // 대표(리더) 선택: 음성 접속중인 멤버 우선
+        let leader = null;
+        for (let i = 0; i < team.length; i++) {
+          const mem = message.guild.members.cache.get(String(team[i]));
+          if (mem && mem.voice && mem.voice.channel) { leader = mem; break; }
+        }
+        if (!leader) {
+          // 접속중인 멤버가 없으면 이 팀은 스킵
+          continue;
+        }
+
+        const beforeIds = snapshotVoiceIds();
+
+        // 리더를 partyCreate로 이동 -> PartyBeast가 새 방 생성
+        try {
+          await leader.voice.setChannel(partyCreate);
+        } catch (e) {
+          console.error('[Split] leader move failed:', leader.id, e && e.message ? e.message : e);
+          continue;
+        }
+
+        // 방 생성 대기
+        const newRoom = await waitForNewRoom(beforeIds);
+        if (!newRoom) {
+          try { await message.reply('나눠 실패: 방 생성 감지 실패(타임아웃).'); } catch (e) {}
+          return;
+        }
+
+        createdRoomIds.push(String(newRoom.id));
+
+        // 팀원 전체를 새 방으로 이동(리더 포함)
+        for (let i = 0; i < team.length; i++) {
+          const mem = message.guild.members.cache.get(String(team[i]));
+          if (!mem) continue;
+          if (!mem.voice || !mem.voice.channel) continue;
+
+          try {
+            await mem.voice.setChannel(newRoom);
+            try { lastDisbandedMemberIds.add(String(mem.id)); } catch (ee) {}
+          } catch (e) {
+            console.error('[Split] move failed:', mem.id, e && e.message ? e.message : e);
+          }
+        }
+
+        // 다음 팀 생성 전 대기(파티비스트 안정화)
+        await delay(1200);
+      }
+
+      if (createdRoomIds.length === 0) {
+        try { await message.reply('나눠 실패: 생성된 방이 없다. (파티비스트 설정/권한/대상 인원 확인)'); } catch (e) {}
+        return;
+      }
+
+      try { await message.channel.send('나눠 완료: ' + createdRoomIds.length + '개 방 생성 및 이동'); } catch (e) {}
+    } catch (e) {
+      console.error('[Split] error:', e && e.stack ? e.stack : e);
+      try { await message.reply('나눠 실패: 내부 오류. 로그 확인.'); } catch (ee) {}
+    }
+
+    return;
+  }
+if (command === '해산') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    if (!isTeamCommandTextChannel(message)) {
+      try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
+      return;
+    }
+
+
     if (latestTeams.length === 0) {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
     }
@@ -1607,16 +1306,17 @@ client.on('message', async (message) => {
       const channel = message.guild.channels.cache.get(channelId);
       if (!channel || channel.type !== 'voice') return;
 
-      team.forEach(name => {
-        const member = message.guild.members.cache.find(m => m.displayName === name);
-        if (member && member.voice.channel) {
+      for (let j = 0; j < team.length; j++) {
+        const memberId = String(team[j]);
+        const member = message.guild.members.cache.get(memberId);
+        if (member && member.voice && member.voice.channel) {
           member.voice.setChannel(channel).then(() => {
             try { lastDisbandedMemberIds.add(String(member.id)); } catch (e) {}
           }).catch(err => {
-            console.error('이동 실패:', member.displayName, err.message);
+            console.error('이동 실패:', member.displayName, err && err.message ? err.message : err);
           });
         }
-      });
+      }
     });
 
     message.channel.send('모든 인원을 이동 시켰습니다!!! @here');
