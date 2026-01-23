@@ -696,6 +696,9 @@ async function handleAiChat(message) {
 
 const PUBG_PATCH_LIST_URL = 'https://pubg.com/ko/news?category=patch_notes&label=label_pc';
 
+
+const PUBG_PATCH_LIST_URL_ALT = 'https://pubg.com/ko/news?category=patch_notes';
+const PUBG_PATCH_LIST_URL_ALT2 = 'https://pubg.com/news?category=patch_notes&label=label_pc';
 // fallback 목록 URL (상황에 따라 리다이렉트/차단/지역 분기 존재)
 const PUBG_PATCH_LIST_URLS = [
   'https://pubg.com/ko/news?category=patch_notes&label=label_pc',
