@@ -892,6 +892,289 @@ function stripTagsToText(html) {
   return s.trim();
 }
 
+function tryParseJsonSafe(s) {
+  try { return JSON.parse(String(s || '')); } catch (e) { return null; }
+}
+
+function extractAllLdJsonObjects(html) {
+  const out = [];
+  if (!html) return out;
+
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/ig;
+  let m;
+  while ((m = re.exec(String(html))) !== null) {
+    const raw = String(m[1] || '').trim();
+    if (!raw) continue;
+    const obj = tryParseJsonSafe(raw);
+    if (!obj) continue;
+
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length; i++) out.push(obj[i]);
+    } else {
+      out.push(obj);
+    }
+  }
+  return out;
+}
+
+function extractLdJsonBody(html) {
+  const objs = extractAllLdJsonObjects(html);
+  let best = '';
+  let bestScore = -1;
+
+  for (let i = 0; i < objs.length; i++) {
+    const o = objs[i];
+    if (!o || typeof o !== 'object') continue;
+
+    const body = (typeof o.articleBody === 'string') ? o.articleBody : '';
+    if (!body || body.length < 200) continue;
+
+    const sc = scorePatchTextCandidate(body);
+    if (sc > bestScore) {
+      bestScore = sc;
+      best = body;
+    }
+  }
+  return best;
+}
+
+function extractNextDataJson(html) {
+  if (!html) return null;
+
+  const m = String(html).match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (!m || !m[1]) return null;
+
+  const raw = String(m[1] || '').trim();
+  if (!raw) return null;
+
+  return tryParseJsonSafe(raw);
+}
+
+function countHangulChars(s) {
+  const m = String(s || '').match(/[가-힣]/g);
+  return m ? m.length : 0;
+}
+
+function upperIndexOf(hay, needle) {
+  return String(hay || '').toUpperCase().indexOf(String(needle || '').toUpperCase());
+}
+
+function scorePatchTextCandidate(raw) {
+  if (!raw) return -1;
+  const s0 = String(raw);
+  if (s0.length < 200) return -1;
+
+  // Convert to plain text for scoring
+  let plain = s0;
+  if (/<[^>]+>/.test(plain)) plain = stripTagsToText(plain);
+  else plain = decodeHtmlEntities(plain);
+
+  plain = String(plain || '').trim();
+  if (plain.length < 200) return -1;
+
+  const len = plain.length;
+  const hangul = countHangulChars(plain);
+  const ratio = hangul / Math.max(1, len);
+
+  // Strong negative signals (footer/menu)
+  const badTokens = [
+    'LEARN MORE PUBG', 'PLAY NOW', 'ENGLISH (GLOBAL)', 'GAME INFO', 'COMMUNITY', 'SUPPORT',
+    'Epic Games', 'PlayStation', 'Steam', 'XBOX', 'MEDIA', 'KRAFTON', 'KRAFTON ID',
+  ];
+
+  let badHits = 0;
+  for (let i = 0; i < badTokens.length; i++) {
+    if (upperIndexOf(plain, badTokens[i]) >= 0) badHits++;
+  }
+
+  // Positive signals (patch note words)
+  const goodTokens = [
+    '패치', '패치노트', '업데이트', '변경', '개선', '수정', '버그', '밸런스', '신규', '추가',
+    '무기', '차량', '맵', '전장', '아이템', '모드', '경쟁전', '서바이버', '리콜',
+  ];
+
+  let goodHits = 0;
+  for (let j = 0; j < goodTokens.length; j++) {
+    if (plain.indexOf(goodTokens[j]) >= 0) goodHits++;
+  }
+
+  // Heading / list structure
+  const headings = (plain.match(/\n\s*#{1,6}\s+/g) || []).length +
+                   (plain.match(/\n\s*[0-9]+\./g) || []).length;
+  const bullets = (plain.match(/\n\s*[-*•]\s+/g) || []).length;
+
+  // Base score = length, then add signals
+  let score = len;
+
+  // Language preference
+  if (ratio < 0.02) score -= 5000; // likely not Korean or not article body
+  else if (ratio > 0.05) score += 1500;
+
+  score += goodHits * 700;
+  score += headings * 250;
+  score += bullets * 120;
+  score -= badHits * 1500;
+
+  return score;
+}
+
+function findBestPatchBodyFromJson(root) {
+  if (!root) return '';
+
+  const stack = [root];
+  let bestRaw = '';
+  let bestScore = -1;
+  let iter = 0;
+
+  while (stack.length > 0 && iter < 200000) {
+    iter++;
+    const v = stack.pop();
+    if (!v) continue;
+
+    if (typeof v === 'string') {
+      const s = String(v);
+      if (s.length < 200) continue;
+
+      const sc = scorePatchTextCandidate(s);
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestRaw = s;
+      }
+      continue;
+    }
+
+    if (Array.isArray(v)) {
+      for (let i = 0; i < v.length; i++) stack.push(v[i]);
+      continue;
+    }
+
+    if (typeof v === 'object') {
+      const keys = Object.keys(v);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        // Prefer typical body keys a bit by pushing them last (so popped earlier)
+        const val = v[k];
+        stack.push(val);
+      }
+      continue;
+    }
+  }
+
+  return bestRaw;
+}
+
+function trimFooterLikeText(text) {
+  let t = String(text || '').trim();
+  if (!t) return '';
+
+  const markers = [
+    'LEARN MORE PUBG',
+    'ENGLISH (GLOBAL)',
+    'PLAY NOW',
+    'GAME INFO',
+    'COMMUNITY',
+    'SUPPORT - Steam',
+    'SUPPORT',
+    'Epic Games',
+    'PlayStation',
+    'XBOX',
+    'MEDIA',
+  ];
+
+  let cut = -1;
+  const upper = t.toUpperCase();
+  for (let i = 0; i < markers.length; i++) {
+    const idx = upper.indexOf(String(markers[i]).toUpperCase());
+    if (idx >= 0 && idx > 400) {
+      if (cut < 0 || idx < cut) cut = idx;
+    }
+  }
+
+  if (cut > 0) t = t.slice(0, cut);
+
+  // normalize whitespace
+  t = t.replace(/\r/g, '');
+  t = t.replace(/[ \t]+\n/g, '\n');
+  t = t.replace(/\n{3,}/g, '\n\n');
+  return t.trim();
+}
+
+function collectUrlsFromJson(root, mode, maxCount) {
+  const out = [];
+  if (!root) return out;
+
+  const isImage = (mode === 'image');
+  const isVideo = (mode === 'video');
+
+  const reImg = /^https?:\/\/[^\s"'<>]+\.(png|jpe?g|webp|gif)(\?[^\s"'<>]*)?$/i;
+  const reVid = /^(https?:\/\/[^\s"'<>]+\.(mp4|webm)(\?[^\s"'<>]*)?|https?:\/\/[^\s"'<>]*(youtube\.com|youtu\.be|vimeo\.com)[^\s"'<>]*)$/i;
+
+  function isBadMediaUrl(u) {
+    const s = String(u || '').toLowerCase();
+    if (s.indexOf('kraf') >= 0 && s.indexOf('wstatic') < 0) return true;
+    if (s.indexOf('krafton') >= 0 && s.indexOf('wstatic') < 0) return true;
+    if (s.indexOf('krafonid') >= 0) return true;
+    if (s.indexOf('login') >= 0) return true;
+    if (s.indexOf('favicon') >= 0) return true;
+    if (s.indexOf('logo') >= 0) return true;
+    if (s.indexOf('sprite') >= 0) return true;
+    return false;
+  }
+
+  const stack = [root];
+  let iter = 0;
+
+  while (stack.length > 0 && out.length < (maxCount || 10) && iter < 200000) {
+    iter++;
+    const v = stack.pop();
+    if (!v) continue;
+
+    if (typeof v === 'string') {
+      const s = String(v).trim();
+      if (!s) continue;
+      if (s.indexOf('http') !== 0) continue;
+
+      if (isImage && reImg.test(s) && !isBadMediaUrl(s)) uniquePush(out, s);
+      else if (isVideo && reVid.test(s) && !isBadMediaUrl(s)) uniquePush(out, s);
+      continue;
+    }
+
+    if (Array.isArray(v)) {
+      for (let i = 0; i < v.length; i++) stack.push(v[i]);
+      continue;
+    }
+
+    if (typeof v === 'object') {
+      const keys = Object.keys(v);
+      for (let i = 0; i < keys.length; i++) stack.push(v[keys[i]]);
+      continue;
+    }
+  }
+
+  return out;
+}
+
+function isProbablyPatchBodyText(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  if (t.length < 800) return false;
+
+  const hangul = countHangulChars(t);
+  if (hangul < 200) return false;
+
+  if (t.indexOf('업데이트') >= 0) return true;
+  if (t.indexOf('패치') >= 0) return true;
+  if (t.indexOf('패치 노트') >= 0) return true;
+
+  // weak fallback: lots of list items / headings
+  const bullets = (t.match(/\n\s*[-*•]\s+/g) || []).length;
+  const headings = (t.match(/\n\s*#{1,6}\s+/g) || []).length;
+  if (bullets >= 8 || headings >= 3) return true;
+
+  return false;
+}
+
+
 function uniquePush(arr, v) {
   const s = String(v || '').trim();
   if (!s) return;
@@ -1054,7 +1337,7 @@ function extractUrlsByTagAttr(html, tagName, attrName, baseUrl, maxCount) {
 }
 
 function parsePatchNoteFromArticle(html, finalUrl) {
-  const baseUrl = finalUrl || 'https://pubg.com/news';
+  const baseUrl = finalUrl || 'https://pubg.com/ko/news';
 
   const title =
     extractMetaContent(html, 'property', 'og:title') ||
@@ -1079,6 +1362,7 @@ function parsePatchNoteFromArticle(html, finalUrl) {
     extractMetaContent(html, 'property', 'article:published_time') ||
     extractMetaContent(html, 'name', 'pubdate') ||
     extractMetaContent(html, 'name', 'publish-date') ||
+    extractMetaContent(html, 'name', 'date') ||
     '';
 
   // Try to isolate <article> first
@@ -1092,36 +1376,105 @@ function parsePatchNoteFromArticle(html, finalUrl) {
     else articleHtml = String(html || '');
   }
 
-  const contentText = stripTagsToText(articleHtml);
+  // Candidate bodies:
+  const ldBody = extractLdJsonBody(html);
+  const nextObj = extractNextDataJson(html);
+  const nextBodyRaw = nextObj ? findBestPatchBodyFromJson(nextObj) : '';
+
+  let bestRaw = '';
+  let bestScore = -1;
+
+  function consider(raw) {
+    if (!raw) return;
+    const sc = scorePatchTextCandidate(raw);
+    if (sc > bestScore) {
+      bestScore = sc;
+      bestRaw = raw;
+    }
+  }
+
+  consider(nextBodyRaw);
+  consider(ldBody);
+  consider(articleHtml);
+
+  // Convert chosen raw to text
+  let contentText = '';
+  if (bestRaw) {
+    if (/<[^>]+>/.test(bestRaw)) contentText = stripTagsToText(bestRaw);
+    else contentText = decodeHtmlEntities(bestRaw);
+  }
+
+  if (!contentText) contentText = stripTagsToText(articleHtml);
+  contentText = trimFooterLikeText(contentText);
+
+  // If still looks wrong, fallback to full html stripped
+  if (!isProbablyPatchBodyText(contentText)) {
+    const fallback = trimFooterLikeText(stripTagsToText(String(html || '')));
+    if (isProbablyPatchBodyText(fallback)) contentText = fallback;
+  }
+
+  function isBadMediaUrlLocal(u) {
+    const s = String(u || '').toLowerCase();
+    if (s.indexOf('krafonid') >= 0) return true;
+    if (s.indexOf('krafton') >= 0 && s.indexOf('wstatic') < 0) return true;
+    if (s.indexOf('login') >= 0) return true;
+    if (s.indexOf('logo') >= 0) return true;
+    if (s.indexOf('sprite') >= 0) return true;
+    if (s.indexOf('favicon') >= 0) return true;
+    return false;
+  }
 
   // Collect media
   const imageUrls = [];
-  const bodyImg = extractUrlsByTagAttr(articleHtml, 'img', 'src', baseUrl, 6);
-  for (let i = 0; i < bodyImg.length; i++) uniquePush(imageUrls, bodyImg[i]);
+  const bodyImg = extractUrlsByTagAttr(articleHtml, 'img', 'src', baseUrl, 10);
+  for (let i = 0; i < bodyImg.length; i++) {
+    if (!isBadMediaUrlLocal(bodyImg[i])) uniquePush(imageUrls, bodyImg[i]);
+  }
 
-  const bodyImg2 = extractUrlsByTagAttr(articleHtml, 'img', 'data-src', baseUrl, 6);
-  for (let i = 0; i < bodyImg2.length; i++) uniquePush(imageUrls, bodyImg2[i]);
+  const bodyImg2 = extractUrlsByTagAttr(articleHtml, 'img', 'data-src', baseUrl, 10);
+  for (let i = 0; i < bodyImg2.length; i++) {
+    if (!isBadMediaUrlLocal(bodyImg2[i])) uniquePush(imageUrls, bodyImg2[i]);
+  }
 
-  if (imageUrl) uniquePush(imageUrls, resolveUrl(baseUrl, imageUrl));
+  // From Next.js JSON (often contains the real media urls)
+  if (nextObj) {
+    const jimgs = collectUrlsFromJson(nextObj, 'image', 12);
+    for (let i = 0; i < jimgs.length; i++) {
+      if (!isBadMediaUrlLocal(jimgs[i])) uniquePush(imageUrls, jimgs[i]);
+    }
+  }
+
+  if (imageUrl) {
+    const abs = resolveUrl(baseUrl, imageUrl);
+    if (!isBadMediaUrlLocal(abs)) uniquePush(imageUrls, abs);
+  }
 
   const videoUrls = [];
   if (ogVideo) uniquePush(videoUrls, resolveUrl(baseUrl, ogVideo));
 
-  const ifr = extractUrlsByTagAttr(articleHtml, 'iframe', 'src', baseUrl, 4);
-  for (let i = 0; i < ifr.length; i++) uniquePush(videoUrls, ifr[i]);
+  const ifr = extractUrlsByTagAttr(articleHtml, 'iframe', 'src', baseUrl, 6);
+  for (let i = 0; i < ifr.length; i++) {
+    if (!isBadMediaUrlLocal(ifr[i])) uniquePush(videoUrls, ifr[i]);
+  }
 
-  const vid = extractUrlsByTagAttr(articleHtml, 'video', 'src', baseUrl, 4);
-  for (let i = 0; i < vid.length; i++) uniquePush(videoUrls, vid[i]);
+  const vid = extractUrlsByTagAttr(articleHtml, 'video', 'src', baseUrl, 6);
+  for (let i = 0; i < vid.length; i++) {
+    if (!isBadMediaUrlLocal(vid[i])) uniquePush(videoUrls, vid[i]);
+  }
 
-  // Fallback if no text
-  const finalText = contentText || stripTagsToText(String(html || ''));
+  if (nextObj) {
+    const jvids = collectUrlsFromJson(nextObj, 'video', 6);
+    for (let i = 0; i < jvids.length; i++) {
+      if (!isBadMediaUrlLocal(jvids[i])) uniquePush(videoUrls, jvids[i]);
+    }
+  }
 
   return {
     title: title,
     url: String(finalUrl || ''),
     imageUrl: imageUrl ? resolveUrl(baseUrl, imageUrl) : '',
     publishedText: published,
-    contentText: finalText,
+    contentText: contentText,
     imageUrls: imageUrls,
     videoUrls: videoUrls,
   };
@@ -1136,66 +1489,99 @@ async function fetchLatestPubgPatchNote(options) {
   if (pubgPatchCache.data && pubgPatchCache.fetchedAtMs && (now - pubgPatchCache.fetchedAtMs) < PUBG_CACHE_TTL_MS) {
     const cached = pubgPatchCache.data;
     if (cached && cached.url) {
+      pubgLog('cache_hit url=' + cached.url);
       return cached;
     }
   }
 
-  let chosenListUrl = '';
-  let latestUrl = '';
+  let listHtml = '';
+  let listFinalUrl = '';
+  let candidates = [];
+  let lastListError = null;
 
   for (let i = 0; i < PUBG_PATCH_LIST_URLS.length; i++) {
-    const listUrl = PUBG_PATCH_LIST_URLS[i];
+    const u = PUBG_PATCH_LIST_URLS[i];
     try {
-      const listRes = await fetchHtml(listUrl, PUBG_HTTP_TIMEOUT_MS);
-      pubgLog('[PUBG_LIST] fetched', 'url=' + listRes.url, 'status=' + listRes.statusCode, 'bytes=' + (listRes.html ? listRes.html.length : 0));
+      pubgLog('fetch_list try url=' + u);
+      const listRes = await fetchHtml(u, PUBG_HTTP_TIMEOUT_MS);
+      if (!listRes || !listRes.ok) throw new Error('list fetch failed');
 
-      if (!listRes || !listRes.ok || !listRes.html) continue;
+      listHtml = listRes.html || '';
+      listFinalUrl = listRes.url || u;
 
-      const candidates = extractCandidateNewsUrlsFromHtml(listRes.html || '', listRes.url || listUrl);
-      pubgLog('[PUBG_LIST] candidates', 'count=' + (candidates ? candidates.length : 0));
+      candidates = extractCandidateNewsUrlsFromHtml(listHtml, listFinalUrl);
+      pubgLog('list_candidates count=' + (candidates ? candidates.length : 0));
 
-      const best = pickBestCandidate(candidates);
-      if (best && best.url) {
-        chosenListUrl = listRes.url || listUrl;
-        latestUrl = best.url;
-        pubgLog('[PUBG_LIST] pick', 'best=' + latestUrl, 'score=' + best.score, 'id=' + best.id);
-        break;
-      }
+      if (candidates && candidates.length > 0) break;
     } catch (e) {
-      pubgLog('[PUBG_LIST] fetch failed', listUrl, e && e.message ? e.message : e);
+      lastListError = e;
+      pubgLog('fetch_list failed url=' + u + ' err=' + (e && e.message ? e.message : e));
     }
   }
 
-  if (!latestUrl) {
+  if (!candidates || candidates.length === 0) {
+    if (lastListError) throw lastListError;
     throw new Error('PUBG patch link not found');
   }
 
-  // 기사 페이지 fetch
-  const articleRes = await fetchHtml(latestUrl, PUBG_HTTP_TIMEOUT_MS);
-  pubgLog('[PUBG_ARTICLE] fetched', 'url=' + (articleRes ? articleRes.url : latestUrl), 'status=' + (articleRes ? articleRes.statusCode : 0));
+  // Sort candidates (by score/id)
+  pickBestCandidate(candidates); // sorts in-place (side effect)
 
-  if (!articleRes || !articleRes.ok) {
-    const sc = articleRes && articleRes.statusCode ? articleRes.statusCode : 0;
-    throw new Error('PUBG article fetch failed (HTTP ' + sc + ')');
+  const TRY_MAX = Math.min(candidates.length, 6);
+  let chosenParsed = null;
+  let chosenUrl = '';
+  let chosenResUrl = '';
+  let lastErr = null;
+
+  for (let i = 0; i < TRY_MAX; i++) {
+    const c = candidates[i];
+    if (!c || !c.url) continue;
+
+    pubgLog('try_candidate[' + i + '] url=' + c.url + ' score=' + c.score + ' id=' + c.id);
+
+    try {
+      const articleRes = await fetchHtml(c.url, PUBG_HTTP_TIMEOUT_MS);
+      if (!articleRes || !articleRes.ok) throw new Error('PUBG article fetch failed');
+
+      const parsed = parsePatchNoteFromArticle(articleRes.html || '', articleRes.url || c.url);
+      const bodyText = String(parsed.contentText || '').trim();
+
+      if (isProbablyPatchBodyText(bodyText)) {
+        chosenParsed = parsed;
+        chosenUrl = String(parsed.url || c.url);
+        chosenResUrl = String(articleRes.url || c.url);
+        pubgLog('candidate_ok url=' + chosenUrl + ' finalUrl=' + chosenResUrl + ' textLen=' + bodyText.length);
+        break;
+      }
+
+      lastErr = new Error('candidate not patch body');
+      pubgLog('candidate_skip reason=not_patch_body textLen=' + bodyText.length);
+    } catch (e) {
+      lastErr = e;
+      pubgLog('candidate_fail err=' + (e && e.message ? e.message : e));
+    }
   }
 
-  const parsed = parsePatchNoteFromArticle(articleRes.html || '', articleRes.url || latestUrl);
+  if (!chosenParsed) {
+    if (lastErr) throw lastErr;
+    throw new Error('PUBG patch content not found');
+  }
+
+  const contentText = String(chosenParsed.contentText || '').trim();
 
   // excerpt
-  const contentText = String(parsed.contentText || '').trim();
   let excerpt = contentText;
   if (wantChars > 0 && excerpt.length > wantChars) {
     excerpt = excerpt.slice(0, wantChars) + '\n\n(이하 생략)';
   }
 
   const out = {
-    title: parsed.title,
-    url: parsed.url,
-    listUrl: chosenListUrl || PUBG_PATCH_LIST_URL,
-    publishedText: parsed.publishedText,
-    imageUrl: parsed.imageUrl,
-    imageUrls: parsed.imageUrls || [],
-    videoUrls: parsed.videoUrls || [],
+    title: chosenParsed.title,
+    url: chosenUrl,
+    publishedText: chosenParsed.publishedText,
+    imageUrl: chosenParsed.imageUrl,
+    imageUrls: chosenParsed.imageUrls || [],
+    videoUrls: chosenParsed.videoUrls || [],
     contentText: contentText,
     excerptText: excerpt,
   };
@@ -1203,6 +1589,8 @@ async function fetchLatestPubgPatchNote(options) {
   pubgPatchCache.url = out.url;
   pubgPatchCache.fetchedAtMs = nowMs();
   pubgPatchCache.data = out;
+
+  pubgLog('cache_set url=' + out.url + ' title=' + safeShort(out.title, 80) + ' textLen=' + out.contentText.length);
 
   return out;
 }
@@ -1222,7 +1610,9 @@ async function fetchLatestPubgPatchNoteSummary(options) {
   if (OPENAI_API_KEY) {
     const instructionText =
       '너는 게임 패치노트 요약 봇이다. ' +
-      '한국어로 핵심만 정리한다. ' +
+      '반드시 한국어로만 답한다. ' +
+      '원문에 있는 내용만 요약한다. 추측하지 않는다. ' +
+      '핵심만 정리한다. ' +
       '불릿 5~10개로 요약한다. ' +
       '패치 항목이 많으면 섹션별로 묶는다.';
 
