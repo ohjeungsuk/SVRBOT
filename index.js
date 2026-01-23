@@ -688,52 +688,52 @@ async function handleAiChat(message) {
 }
 
 // ---- PUBG Patch Notes Helper Functions ----
-// NOTE:
-// PUBG 사이트는 일부 페이지가 CSR(클라이언트 렌더링) 기반이라, 목록 HTML에 <a href="..."> 가 없거나,
-// 링크가 script/데이터 속성 안에만 존재하는 경우가 있습니다.
-// 그래서 아래 구현은 href 뿐 아니라, HTML 전체에서 /news/<id> 패턴을 폭넓게 탐색하고(컨텍스트 점수 기반),
-// 필요 시 여러 목록 URL을 순차적으로 시도합니다.
+// 목표: PUBG 공식 사이트에서 "PC 패치노트" 최신 글을 찾아서 본문을 추출하고(한국어),
+// !배그패치 명령으로 요약 + 일부/원문을 디스코드에 출력한다.
+//
+// 주의:
+// - PUBG 사이트가 React/Next 기반이라 링크가 HTML에 직접 안 나오는 경우가 있어,
+//   "id(숫자/8자리)"를 다양한 패턴으로 뽑아 상위 후보부터 실제 글 페이지를 확인한다.
+// - 환경변수 PUBG_DEBUG=1 이면 후보 점수/선택 과정을 로그로 출력한다.
 
 const PUBG_PATCH_LIST_URL = 'https://pubg.com/ko/news?category=patch_notes&label=label_pc';
-
-
-const PUBG_PATCH_LIST_URL_ALT = 'https://pubg.com/ko/news?category=patch_notes';
-const PUBG_PATCH_LIST_URL_ALT2 = 'https://pubg.com/news?category=patch_notes&label=label_pc';
-// fallback 목록 URL (상황에 따라 리다이렉트/차단/지역 분기 존재)
-const PUBG_PATCH_LIST_URLS = [
-  'https://pubg.com/ko/news?category=patch_notes&label=label_pc',
-  'https://pubg.com/ko/news?category=patch_notes',
-  'https://pubg.com/en/news?category=patch_notes&label=label_pc',
-  'https://pubg.com/en/news?category=patch_notes',
-  'https://pubg.com/news?category=patch_notes&label=label_pc',
-  'https://pubg.com/news?category=patch_notes',
-  'https://www.pubg.com/ko/news?category=patch_notes&label=label_pc',
-  'https://www.pubg.com/ko/news?category=patch_notes',
-  'https://www.pubg.com/en/news?category=patch_notes&label=label_pc',
-  'https://www.pubg.com/en/news?category=patch_notes',
-];
+const PUBG_PATCH_LIST_URL_FALLBACK = 'https://pubg.com/ko/news?category=patch_notes';
 
 const PUBG_HTTP_TIMEOUT_MS = 25000;
-const PUBG_MAX_HTML_BYTES = 6 * 1024 * 1024; // 6MB
+const PUBG_MAX_HTML_BYTES = 8 * 1024 * 1024; // 8MB
 const PUBG_CACHE_TTL_MS = 10 * 60 * 1000;    // 10 minutes
-const PUBG_DEFAULT_EXCERPT_CHARS = 4500;
-const PUBG_FULL_EXCERPT_CHARS = 15000;
 
-// Optional debug (Heroku Config Vars): PUBG_DEBUG=1
+const PUBG_DEFAULT_EXCERPT_CHARS = 4500;     // 기본 발췌 길이
+const PUBG_FULL_EXCERPT_CHARS = 15000;       // 전체 모드 최대
+
 const PUBG_DEBUG = String(process.env.PUBG_DEBUG || '') === '1';
 
 const pubgPatchCache = {
-  url: '',
+  key: '',
   fetchedAtMs: 0,
   data: null,
 };
+
+const pubgHttpCache = new Map(); // url -> { atMs, finalUrl, statusCode, html }
 
 function pubgLog() {
   if (!PUBG_DEBUG) return;
   try { console.log.apply(console, arguments); } catch (e) {}
 }
 
-function decodeHtmlEntities(s) {
+function pubgNowMs() {
+  return new Date().getTime();
+}
+
+function pubgEscapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function pubgResolveUrl(base, href) {
+  try { return new URL(String(href), String(base)).toString(); } catch (e) { return String(href || ''); }
+}
+
+function pubgDecodeHtmlEntities(s) {
   if (!s) return '';
   return String(s)
     .replace(/&nbsp;/g, ' ')
@@ -745,66 +745,46 @@ function decodeHtmlEntities(s) {
     .replace(/&apos;/g, "'");
 }
 
-function resolveUrl(base, href) {
-  try {
-    return new URL(String(href), String(base)).toString();
-  } catch (e) {
-    return String(href || '');
-  }
-}
-
-function gunzipIfNeeded(buf, encoding, cb) {
+function pubgGunzipIfNeeded(buf, encoding, cb) {
   const enc = String(encoding || '').toLowerCase();
-  if (enc === 'gzip') {
-    zlib.gunzip(buf, cb);
-    return;
-  }
-  if (enc === 'deflate') {
-    zlib.inflate(buf, cb);
-    return;
-  }
+  if (enc === 'gzip') { zlib.gunzip(buf, cb); return; }
+  if (enc === 'deflate') { zlib.inflate(buf, cb); return; }
   if (enc === 'br') {
-    if (zlib.brotliDecompress) {
-      zlib.brotliDecompress(buf, cb);
-      return;
-    }
+    if (zlib.brotliDecompress) { zlib.brotliDecompress(buf, cb); return; }
   }
   cb(null, buf);
 }
 
-function fetchHtml(url, timeoutMs) {
+function fetchHtmlRaw(url, timeoutMs) {
   return new Promise((resolve, reject) => {
     const maxRedirects = 5;
 
     function go(u, redirectsLeft) {
+      let urlObj;
+      try { urlObj = new URL(String(u)); } catch (e) { reject(e); return; }
+
       const req = https.request(
-        u,
         {
+          protocol: urlObj.protocol,
+          hostname: urlObj.hostname,
+          path: urlObj.pathname + urlObj.search,
           method: 'GET',
           headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
             'Accept-Encoding': 'gzip, deflate, br',
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Dest': 'document',
-            'Referer': 'https://pubg.com/',
           },
           timeout: timeoutMs || PUBG_HTTP_TIMEOUT_MS,
         },
         (res) => {
-          if (!res) {
-            reject(new Error('no response'));
-            return;
-          }
+          if (!res) { reject(new Error('no response')); return; }
 
           // Redirect
           if (res.statusCode >= 300 && res.statusCode < 400 && res.headers && res.headers.location && redirectsLeft > 0) {
-            const nextUrl = resolveUrl(u, res.headers.location);
+            const nextUrl = pubgResolveUrl(u, res.headers.location);
             res.resume();
             go(nextUrl, redirectsLeft - 1);
             return;
@@ -826,14 +806,11 @@ function fetchHtml(url, timeoutMs) {
           res.on('end', () => {
             const buf = Buffer.concat(chunks);
             const enc = res.headers ? res.headers['content-encoding'] : '';
-            gunzipIfNeeded(buf, enc, (err, outBuf) => {
-              if (err) {
-                reject(err);
-                return;
-              }
+            pubgGunzipIfNeeded(buf, enc, (err, outBuf) => {
+              if (err) { reject(err); return; }
+              // 일반적으로 UTF-8. (한국어 페이지)
               const html = outBuf.toString('utf8');
-              const status = res.statusCode || 0;
-              resolve({ ok: (status >= 200 && status < 400), url: u, statusCode: status, html: html });
+              resolve({ ok: true, url: String(u), finalUrl: String(u), statusCode: res.statusCode, html: html, headers: res.headers || {} });
             });
           });
 
@@ -854,18 +831,35 @@ function fetchHtml(url, timeoutMs) {
   });
 }
 
-function extractMetaContent(html, key, val) {
+async function fetchHtmlWithCache(url, timeoutMs) {
+  const u = String(url || '');
+  const now = pubgNowMs();
+
+  const cached = pubgHttpCache.get(u);
+  if (cached && cached.atMs && (now - cached.atMs) < PUBG_CACHE_TTL_MS && cached.html) {
+    return cached;
+  }
+
+  const res = await fetchHtmlRaw(u, timeoutMs || PUBG_HTTP_TIMEOUT_MS);
+  if (!res || !res.ok) throw new Error('fetch failed');
+
+  const obj = { atMs: now, finalUrl: res.finalUrl || u, statusCode: res.statusCode || 0, html: res.html || '' };
+  pubgHttpCache.set(u, obj);
+  return obj;
+}
+
+function pubgExtractMetaContent(html, key, val) {
   if (!html) return '';
-  const re = new RegExp('<meta[^>]+\\b' + escapeRegex(String(key)) + '\\s*=\\s*["\\\']' + escapeRegex(String(val)) + '["\\\'][^>]*>', 'i');
+  const re = new RegExp('<meta[^>]+\\b' + pubgEscapeRegex(String(key)) + '\\s*=\\s*["\\\']' + pubgEscapeRegex(String(val)) + '["\\\'][^>]*>', 'i');
   const m = String(html).match(re);
   if (!m) return '';
   const tag = m[0];
   const m2 = tag.match(/\bcontent\s*=\s*["']([^"']+)["']/i);
   if (!m2) return '';
-  return decodeHtmlEntities(String(m2[1] || '')).trim();
+  return pubgDecodeHtmlEntities(String(m2[1] || '')).trim();
 }
 
-function stripTagsToText(html) {
+function pubgStripTagsToText(html) {
   if (!html) return '';
   let s = String(html);
 
@@ -874,7 +868,6 @@ function stripTagsToText(html) {
   s = s.replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ');
   s = s.replace(/<svg[\s\S]*?<\/svg>/gi, ' ');
 
-  // line breaks
   s = s.replace(/<br\s*\/?>/gi, '\n');
   s = s.replace(/<\/p\s*>/gi, '\n\n');
   s = s.replace(/<\/h[1-6]\s*>/gi, '\n\n');
@@ -882,12 +875,10 @@ function stripTagsToText(html) {
   s = s.replace(/<li[^>]*>/gi, '- ');
   s = s.replace(/<\/li\s*>/gi, '\n');
 
-  // remove tags
   s = s.replace(/<[^>]+>/g, ' ');
 
-  s = decodeHtmlEntities(s);
+  s = pubgDecodeHtmlEntities(s);
 
-  // normalize whitespace
   s = s.replace(/\r/g, '');
   s = s.replace(/[ \t]+\n/g, '\n');
   s = s.replace(/\n{3,}/g, '\n\n');
@@ -895,989 +886,333 @@ function stripTagsToText(html) {
   return s.trim();
 }
 
-function tryParseJsonSafe(s) {
-  try { return JSON.parse(String(s || '')); } catch (e) { return null; }
-}
-
-function extractAllLdJsonObjects(html) {
-  const out = [];
-  if (!html) return out;
-
-  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/ig;
-  let m;
-  while ((m = re.exec(String(html))) !== null) {
-    const raw = String(m[1] || '').trim();
-    if (!raw) continue;
-    const obj = tryParseJsonSafe(raw);
-    if (!obj) continue;
-
-    if (Array.isArray(obj)) {
-      for (let i = 0; i < obj.length; i++) out.push(obj[i]);
-    } else {
-      out.push(obj);
-    }
-  }
-  return out;
-}
-
-function extractLdJsonBody(html) {
-  const objs = extractAllLdJsonObjects(html);
-  let best = '';
-  let bestScore = -1;
-
-  for (let i = 0; i < objs.length; i++) {
-    const o = objs[i];
-    if (!o || typeof o !== 'object') continue;
-
-    const body = (typeof o.articleBody === 'string') ? o.articleBody : '';
-    if (!body || body.length < 200) continue;
-
-    const sc = scorePatchTextCandidate(body);
-    if (sc > bestScore) {
-      bestScore = sc;
-      best = body;
-    }
-  }
-  return best;
-}
-
-
-function countHangulChars(s) {
-  const m = String(s || '').match(/[가-힣]/g);
-  return m ? m.length : 0;
-}
-
-function upperIndexOf(hay, needle) {
-  return String(hay || '').toUpperCase().indexOf(String(needle || '').toUpperCase());
-}
-
-function scorePatchTextCandidate(raw) {
-  if (!raw) return -1;
-  const s0 = String(raw);
-  if (s0.length < 200) return -1;
-
-  // Convert to plain text for scoring
-  let plain = s0;
-  if (/<[^>]+>/.test(plain)) plain = stripTagsToText(plain);
-  else plain = decodeHtmlEntities(plain);
-
-  plain = String(plain || '').trim();
-  if (plain.length < 200) return -1;
-
-  const len = plain.length;
-  const hangul = countHangulChars(plain);
-  const ratio = hangul / Math.max(1, len);
-
-  // Strong negative signals (footer/menu)
-  const badTokens = [
-    'LEARN MORE PUBG', 'PLAY NOW', 'ENGLISH (GLOBAL)', 'GAME INFO', 'COMMUNITY', 'SUPPORT',
-    'Epic Games', 'PlayStation', 'Steam', 'XBOX', 'MEDIA', 'KRAFTON', 'KRAFTON ID',
-  ];
-
-  let badHits = 0;
-  for (let i = 0; i < badTokens.length; i++) {
-    if (upperIndexOf(plain, badTokens[i]) >= 0) badHits++;
-  }
-
-  // Positive signals (patch note words)
-  const goodTokens = [
-    '패치', '패치노트', '업데이트', '변경', '개선', '수정', '버그', '밸런스', '신규', '추가',
-    '무기', '차량', '맵', '전장', '아이템', '모드', '경쟁전', '서바이버', '리콜',
-  ];
-
-  let goodHits = 0;
-  for (let j = 0; j < goodTokens.length; j++) {
-    if (plain.indexOf(goodTokens[j]) >= 0) goodHits++;
-  }
-
-  // Heading / list structure
-  const headings = (plain.match(/\n\s*#{1,6}\s+/g) || []).length +
-                   (plain.match(/\n\s*[0-9]+\./g) || []).length;
-  const bullets = (plain.match(/\n\s*[-*•]\s+/g) || []).length;
-
-  // Base score = length, then add signals
-  let score = len;
-
-  // Language preference
-  if (ratio < 0.02) score -= 5000; // likely not Korean or not article body
-  else if (ratio > 0.05) score += 1500;
-
-  score += goodHits * 700;
-  score += headings * 250;
-  score += bullets * 120;
-  score -= badHits * 1500;
-
-  return score;
-}
-
-function findBestPatchBodyFromJson(root) {
-  if (!root) return '';
-
-  const stack = [root];
-  let bestRaw = '';
-  let bestScore = -1;
-  let iter = 0;
-
-  while (stack.length > 0 && iter < 200000) {
-    iter++;
-    const v = stack.pop();
-    if (!v) continue;
-
-    if (typeof v === 'string') {
-      const s = String(v);
-      if (s.length < 200) continue;
-
-      const sc = scorePatchTextCandidate(s);
-      if (sc > bestScore) {
-        bestScore = sc;
-        bestRaw = s;
-      }
-      continue;
-    }
-
-    if (Array.isArray(v)) {
-      for (let i = 0; i < v.length; i++) stack.push(v[i]);
-      continue;
-    }
-
-    if (typeof v === 'object') {
-      const keys = Object.keys(v);
-      for (let i = 0; i < keys.length; i++) {
-        const k = keys[i];
-        // Prefer typical body keys a bit by pushing them last (so popped earlier)
-        const val = v[k];
-        stack.push(val);
-      }
-      continue;
-    }
-  }
-
-  return bestRaw;
-}
-
-function trimFooterLikeText(text) {
-  let t = String(text || '').trim();
-  if (!t) return '';
-
-  const markers = [
-    'LEARN MORE PUBG',
-    'ENGLISH (GLOBAL)',
-    'PLAY NOW',
-    'GAME INFO',
-    'COMMUNITY',
-    'SUPPORT - Steam',
-    'SUPPORT',
-    'Epic Games',
-    'PlayStation',
-    'XBOX',
-    'MEDIA',
-  ];
-
-  let cut = -1;
-  const upper = t.toUpperCase();
-  for (let i = 0; i < markers.length; i++) {
-    const idx = upper.indexOf(String(markers[i]).toUpperCase());
-    if (idx >= 0 && idx > 400) {
-      if (cut < 0 || idx < cut) cut = idx;
-    }
-  }
-
-  if (cut > 0) t = t.slice(0, cut);
-
-  // normalize whitespace
-  t = t.replace(/\r/g, '');
-  t = t.replace(/[ \t]+\n/g, '\n');
-  t = t.replace(/\n{3,}/g, '\n\n');
-  return t.trim();
-}
-
-function collectUrlsFromJson(root, mode, maxCount) {
-  const out = [];
-  if (!root) return out;
-
-  const isImage = (mode === 'image');
-  const isVideo = (mode === 'video');
-
-  const reImg = /^https?:\/\/[^\s"'<>]+\.(png|jpe?g|webp|gif)(\?[^\s"'<>]*)?$/i;
-  const reVid = /^(https?:\/\/[^\s"'<>]+\.(mp4|webm)(\?[^\s"'<>]*)?|https?:\/\/[^\s"'<>]*(youtube\.com|youtu\.be|vimeo\.com)[^\s"'<>]*)$/i;
-
-  function isBadMediaUrl(u) {
-    const s = String(u || '').toLowerCase();
-    if (s.indexOf('kraf') >= 0 && s.indexOf('wstatic') < 0) return true;
-    if (s.indexOf('krafton') >= 0 && s.indexOf('wstatic') < 0) return true;
-    if (s.indexOf('krafonid') >= 0) return true;
-    if (s.indexOf('login') >= 0) return true;
-    if (s.indexOf('favicon') >= 0) return true;
-    if (s.indexOf('logo') >= 0) return true;
-    if (s.indexOf('sprite') >= 0) return true;
-    return false;
-  }
-
-  const stack = [root];
-  let iter = 0;
-
-  while (stack.length > 0 && out.length < (maxCount || 10) && iter < 200000) {
-    iter++;
-    const v = stack.pop();
-    if (!v) continue;
-
-    if (typeof v === 'string') {
-      const s = String(v).trim();
-      if (!s) continue;
-      if (s.indexOf('http') !== 0) continue;
-
-      if (isImage && reImg.test(s) && !isBadMediaUrl(s)) uniquePush(out, s);
-      else if (isVideo && reVid.test(s) && !isBadMediaUrl(s)) uniquePush(out, s);
-      continue;
-    }
-
-    if (Array.isArray(v)) {
-      for (let i = 0; i < v.length; i++) stack.push(v[i]);
-      continue;
-    }
-
-    if (typeof v === 'object') {
-      const keys = Object.keys(v);
-      for (let i = 0; i < keys.length; i++) stack.push(v[keys[i]]);
-      continue;
-    }
-  }
-
-  return out;
-}
-
-function isProbablyPatchBodyText(text) {
-  const t = String(text || '').trim();
-  if (!t) return false;
-  if (t.length < 800) return false;
-
-  const hangul = countHangulChars(t);
-  if (hangul < 200) return false;
-
-  if (t.indexOf('업데이트') >= 0) return true;
-  if (t.indexOf('패치') >= 0) return true;
-  if (t.indexOf('패치 노트') >= 0) return true;
-
-  // weak fallback: lots of list items / headings
-  const bullets = (t.match(/\n\s*[-*•]\s+/g) || []).length;
-  const headings = (t.match(/\n\s*#{1,6}\s+/g) || []).length;
-  if (bullets >= 8 || headings >= 3) return true;
-
-  return false;
-}
-
-
-function uniquePush(arr, v) {
+function pubgUniquePush(arr, v) {
   const s = String(v || '').trim();
   if (!s) return;
   if (arr.indexOf(s) >= 0) return;
   arr.push(s);
 }
 
-function detectLocaleFromUrl(u) {
-  try {
-    const p = new URL(String(u)).pathname.split('/').filter(Boolean);
-    if (p.length > 0 && /^[a-z]{2}(?:-[a-z]{2})?$/i.test(p[0])) return String(p[0]).toLowerCase();
-  } catch (e) {}
-  return '';
-}
-
-// PUBG 뉴스는 최근 /news/9635 처럼 3~7자리 숫자 ID를 사용한다.
-// 8자리(YYYYMMDD) 형태는 구형/다른 페이지에서 섞여 들어오는 경우가 있어 패치노트 후보에서 제외한다.
-function parseNewsIdFromUrl(u) {
-  const s = String(u || '');
-  const m = s.match(/\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?news\/(\d{3,7})(?:[/?#]|$)/i);
-  if (!m) return 0;
-  const n = parseInt(m[1], 10);
-  return isNaN(n) ? 0 : n;
-}
-
-function normalizeNewsUrlToLocale(absUrl, baseUrl) {
-  try {
-    const bu = new URL(String(baseUrl));
-    const au = new URL(String(absUrl));
-    const locale = detectLocaleFromUrl(bu.toString()) || 'ko';
-
-    // origin 통일(리다이렉트/서브도메인 섞임 방지)
-    au.protocol = bu.protocol;
-    au.host = bu.host;
-
-    // /news/ID  -> /{locale}/news/ID
-    if (/^\/news\/\d{3,7}(?:[/?#]|$)/i.test(au.pathname)) {
-      au.pathname = '/' + locale + au.pathname;
-      return au.toString();
-    }
-
-    // /xx/news/ID -> locale로 강제
-    const m = au.pathname.match(/^\/([a-z]{2}(?:-[a-z]{2})?)\/news\/(\d{3,7})(?:[/?#]|$)/i);
-    if (m) {
-      const id = m[2];
-      au.pathname = '/' + locale + '/news/' + id;
-      return au.toString();
-    }
-
-    return au.toString();
-  } catch (e) {
-    return String(absUrl || '');
-  }
-}
-
-function buildNewsUrlForId(baseUrl, id) {
-  try {
-    const bu = new URL(String(baseUrl));
-    const locale = detectLocaleFromUrl(bu.toString()) || 'ko';
-    const n = parseInt(String(id), 10);
-    if (isNaN(n)) return '';
-    return bu.origin + '/' + locale + '/news/' + String(n);
-  } catch (e) {
-    return '';
-  }
-}
-
-function collectPatchNewsObjectsFromNextData(nextObj, limit) {
+function pubgExtractUrlsByTagAttr(html, tagName, attrName, baseUrl, maxCount) {
   const out = [];
-  const seen = {};
+  if (!html) return out;
 
-  function add(id, title, category, label, dateStr) {
-    const n = parseInt(String(id), 10);
-    if (isNaN(n)) return;
-    const idLen = String(n).length;
-    if (idLen >= 8) return; // YYYYMMDD 차단
-    if (idLen < 3 || idLen > 7) return;
-    if (seen[n]) return;
-    seen[n] = 1;
-
-    const t = String(title || '');
-    const c = String(category || '');
-    const l = String(label || '');
-    const d = String(dateStr || '');
-
-    const tLower = t.toLowerCase();
-    const cLower = c.toLowerCase();
-    const lLower = l.toLowerCase();
-
-    let score = 0;
-    if (cLower.indexOf('patch') >= 0 || cLower.indexOf('patch_notes') >= 0) score += 60;
-    if (tLower.indexOf('patch') >= 0 || t.indexOf('패치') >= 0) score += 50;
-    if (t.indexOf('업데이트') >= 0 || tLower.indexOf('update') >= 0) score += 20;
-    if (lLower.indexOf('pc') >= 0 || lLower.indexOf('label_pc') >= 0) score += 10;
-    if (d) score += 2;
-
-    out.push({ id: n, title: t, category: c, label: l, date: d, score: score });
+  const re = new RegExp('<' + pubgEscapeRegex(tagName) + '\\b[^>]*\\b' + pubgEscapeRegex(attrName) + '\\s*=\\s*["\\\']([^"\\\']+)["\\\']', 'ig');
+  let m;
+  while ((m = re.exec(String(html))) !== null) {
+    const href = m[1];
+    const abs = pubgResolveUrl(baseUrl, href);
+    if (abs.indexOf('data:') === 0) continue;
+    if (abs.toLowerCase().indexOf('.svg') >= 0) continue;
+    pubgUniquePush(out, abs);
+    if (maxCount && out.length >= maxCount) break;
   }
-
-  const stack = [nextObj];
-  while (stack.length) {
-    const cur = stack.pop();
-    if (!cur) continue;
-
-    if (Array.isArray(cur)) {
-      for (let i = 0; i < cur.length; i++) stack.push(cur[i]);
-      continue;
-    }
-
-    const t = typeof cur;
-    if (t === 'object') {
-      try {
-        const id = cur.id || cur.newsId || cur.postId || cur.articleId;
-        const title = cur.title || cur.name || cur.subject;
-        const category = cur.category || cur.categoryName || cur.categoryCode || cur.category_code;
-        const label = cur.label || cur.labelCode || cur.tag || cur.platform || cur.device;
-        const dateStr = cur.publishDate || cur.publishedAt || cur.createdAt || cur.date;
-
-        if (id && title) {
-          const titleStr = String(title);
-          const catStr = String(category || '');
-          if (titleStr.indexOf('패치') >= 0 || titleStr.indexOf('업데이트') >= 0 || titleStr.toLowerCase().indexOf('patch') >= 0 || catStr.toLowerCase().indexOf('patch') >= 0) {
-            add(id, titleStr, catStr, label, dateStr);
-          }
-        }
-      } catch (e) {}
-
-      const keys = Object.keys(cur);
-      for (let i = 0; i < keys.length; i++) {
-        try { stack.push(cur[keys[i]]); } catch (e) {}
-      }
-
-      if (limit && out.length >= limit) break;
-      continue;
-    }
-
-    if (t === 'string') {
-      // ignore
-      continue;
-    }
-  }
-
-  out.sort((a, b) => (b.score || 0) - (a.score || 0));
-  if (limit && out.length > limit) return out.slice(0, limit);
   return out;
 }
 
+function pubgExtractMainArticleHtml(fullHtml) {
+  if (!fullHtml) return '';
 
-function scoreByContext(html, idx) {
-  if (!html || idx == null) return 0;
-  const s = String(html);
-  const from = Math.max(0, idx - 500);
-  const to = Math.min(s.length, idx + 500);
-  const seg = s.slice(from, to).toLowerCase();
+  // 1) <article>
+  const mArticle = String(fullHtml).match(/<article[^>]*>([\s\S]*?)<\/article>/i);
+  let body = (mArticle && mArticle[1]) ? mArticle[1] : '';
 
-  let score = 0;
+  // 2) 기사 본문 컨테이너 우선 (ck-content 류)
+  const candidates = [
+    /<div[^>]+class=["'][^"']*(?:ck-content|editor|content|article-content|news-detail|NewsDetail)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i,
+    /<section[^>]+class=["'][^"']*(?:ck-content|editor|content|article-content|news-detail|NewsDetail)[^"']*["'][^>]*>([\s\S]*?)<\/section>/i,
+  ];
 
-  // patch notes 키워드
-  if (seg.indexOf('patch notes') >= 0) score += 30;
-  if (seg.indexOf('patch_notes') >= 0) score += 30;
-  if (seg.indexOf('패치 노트') >= 0) score += 30;
-
-  // pc/label
-  if (seg.indexOf('label_pc') >= 0) score += 15;
-
-  // console/labs 등은 살짝 감점
-  if (seg.indexOf('console') >= 0) score -= 4;
-  if (seg.indexOf('labs') >= 0) score -= 2;
-
-  return score;
-}
-
-function pushCandidate(out, url, baseUrl, html, idx) {
-  if (!url) return;
-
-  const raw = String(url).trim();
-  if (!raw) return;
-
-  // 목록 페이지 쿼리 자체는 제외(예: ?category=patch_notes&...)
-  if (raw.indexOf('?') >= 0) return;
-
-  if (raw.indexOf('/news/') < 0) return;
-
-  let abs = resolveUrl(baseUrl, raw);
-  if (!abs) return;
-
-  // locale(/ko, /en 등) 강제 + origin 통일
-  abs = normalizeNewsUrlToLocale(abs, baseUrl);
-
-  // media 직접 링크 제외
-  if (/\.(png|jpe?g|gif|webp|svg)(?:[?#]|$)/i.test(abs)) return;
-
-  const id = parseNewsIdFromUrl(abs);
-  if (!id) return;
-
-  const score = scoreByContext(html, idx);
-
-  // id 기준 중복 제거(서브도메인/로케일 차이로 URL이 달라도 동일 글)
-  for (let i = 0; i < out.length; i++) {
-    if (out[i] && out[i].id === id) {
-      if (score > out[i].score) {
-        out[i].url = abs;
-        out[i].score = score;
-      }
-      return;
-    }
+  let best = '';
+  for (let i = 0; i < candidates.length; i++) {
+    const re = candidates[i];
+    const m = String(fullHtml).match(re);
+    if (m && m[1] && String(m[1]).length > best.length) best = m[1];
   }
 
-  out.push({ url: abs, id: id, score: score });
+  if (best && best.length > 500) return best;
+  if (body && body.length > 500) return body;
+
+  const mMain = String(fullHtml).match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+  if (mMain && mMain[1]) return mMain[1];
+
+  return String(fullHtml);
 }
 
+function pubgIsLikelyPatchNote(title, contentText) {
+  const t = String(title || '').toLowerCase();
+  const c = String(contentText || '').toLowerCase();
 
+  const hasKeyword =
+    t.indexOf('patch') >= 0 ||
+    t.indexOf('패치') >= 0 ||
+    t.indexOf('업데이트') >= 0 ||
+    c.indexOf('patch notes') >= 0 ||
+    c.indexOf('패치 노트') >= 0 ||
+    c.indexOf('업데이트') >= 0;
 
-function extractNextDataJson(html) {
-  if (!html) return null;
-  const mNext = String(html).match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-  if (!mNext || !mNext[1]) return null;
-  try {
-    return JSON.parse(mNext[1]);
-  } catch (e) {
-    return null;
-  }
-}
+  if (!hasKeyword) return false;
+  if (String(contentText || '').length < 2500) return false;
 
-function normalizeDigitsId(v) {
-  if (v === null || v === undefined) return '';
-  if (typeof v === 'number') {
-    if (!isFinite(v) || v <= 0) return '';
-    return String(Math.floor(v));
-  }
-  const s = String(v).trim();
-  if (!/^\d+$/.test(s)) return '';
-  return s;
-}
-
-function parseDateMs(v) {
-  if (!v) return 0;
-  if (typeof v === 'number' && isFinite(v)) return v > 1000000000000 ? v : (v * 1000);
-  const s = String(v).trim();
-  if (!s) return 0;
-  // ISO or YYYY.MM.DD
-  if (/^\d{4}\.\d{2}\.\d{2}/.test(s)) {
-    const p = s.split(/[^\d]/).filter(Boolean);
-    if (p.length >= 3) {
-      const y = parseInt(p[0], 10);
-      const m = parseInt(p[1], 10);
-      const d = parseInt(p[2], 10);
-      if (!isNaN(y) && !isNaN(m) && !isNaN(d)) return Date.UTC(y, m - 1, d);
-    }
-  }
-  const ms = Date.parse(s);
-  return isNaN(ms) ? 0 : ms;
-}
-
-function pickFirstString(obj, keys) {
-  if (!obj) return '';
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[i];
-    if (obj[k] !== undefined && obj[k] !== null) {
-      const v = obj[k];
-      if (typeof v === 'string') return v;
-    }
-  }
-  return '';
-}
-
-function collectNewsItemsFromObject(root) {
-  const items = [];
-  const seen = new Set();
-
-  function maybePush(obj) {
-    if (!obj || typeof obj !== 'object') return;
-
-    const title = pickFirstString(obj, ['title', 'subject', 'name', 'headline', 'postTitle']);
-    if (!title) return;
-
-    const id =
-      normalizeDigitsId(obj.id) ||
-      normalizeDigitsId(obj.newsId) ||
-      normalizeDigitsId(obj.articleId) ||
-      normalizeDigitsId(obj.contentId) ||
-      normalizeDigitsId(obj.postId) ||
-      '';
-
-    const url = pickFirstString(obj, ['url', 'href', 'path', 'link', 'permalink', 'canonicalUrl']);
-
-    // 최소 조건: id or url 이 있어야 의미 있음
-    if (!id && !url) return;
-
-    const category = pickFirstString(obj, ['category', 'boardCategory', 'boardType', 'type', 'postType']);
-    const label = pickFirstString(obj, ['label', 'platform', 'platformType']);
-
-    // labels 배열/문자열
-    let labels = [];
-    if (obj.labels && Array.isArray(obj.labels)) labels = obj.labels.map((x) => String(x));
-    else if (obj.tags && Array.isArray(obj.tags)) labels = obj.tags.map((x) => String(x));
-    else if (obj.label && typeof obj.label === 'string') labels = [obj.label];
-    else if (obj.platforms && Array.isArray(obj.platforms)) labels = obj.platforms.map((x) => String(x));
-
-    const dateMs =
-      parseDateMs(obj.publishedAt) ||
-      parseDateMs(obj.publishedDate) ||
-      parseDateMs(obj.published_time) ||
-      parseDateMs(obj.createdAt) ||
-      parseDateMs(obj.createDate) ||
-      parseDateMs(obj.updatedAt) ||
-      parseDateMs(obj.date) ||
-      0;
-
-    const key = (id ? ('id:' + id) : ('url:' + url));
-    if (seen.has(key)) return;
-    seen.add(key);
-
-    items.push({
-      id: id,
-      title: String(title),
-      category: String(category || ''),
-      label: String(label || ''),
-      labels: labels,
-      url: String(url || ''),
-      dateMs: dateMs,
-    });
-  }
-
-  function walk(v) {
-    if (!v) return;
-    if (Array.isArray(v)) {
-      for (let i = 0; i < v.length; i++) walk(v[i]);
-      return;
-    }
-    if (typeof v === 'object') {
-      maybePush(v);
-      const keys = Object.keys(v);
-      for (let i = 0; i < keys.length; i++) walk(v[keys[i]]);
-    }
-  }
-
-  walk(root);
-  return items;
-}
-
-function isLikelyPatchNoteItem(item) {
-  if (!item) return false;
-  const title = String(item.title || '');
-  const cat = String(item.category || '').toLowerCase();
-  const labels = (item.labels && Array.isArray(item.labels)) ? item.labels.join(' ') : '';
-  const label = String(item.label || '');
-
-  // 반드시 제목에 패치/patch 가 있어야 후보로 인정
-  const t = title.toLowerCase();
-  const hasPatchWord = (t.indexOf('패치') >= 0) || (t.indexOf('patch') >= 0);
-  if (!hasPatchWord) return false;
-
-  // 카테고리/라벨 힌트 (없어도 통과는 가능)
-  const catOk = (cat.indexOf('patch') >= 0) || (cat.indexOf('patch_notes') >= 0) || (cat.indexOf('patchnotes') >= 0);
-  const labelOk = (labels.indexOf('label_pc') >= 0) || (labels.toLowerCase().indexOf('pc') >= 0) || (label.toLowerCase().indexOf('pc') >= 0);
-
-  // PC 패치노트 리스트에서 뽑는 중이므로, labelOk 아니면 점수에서 밀리게 하되 일단 후보로는 둠
   return true;
 }
 
-function scorePatchItem(item) {
-  const title = String(item.title || '');
-  const t = title.toLowerCase();
-  const cat = String(item.category || '').toLowerCase();
-  const labels = (item.labels && Array.isArray(item.labels)) ? item.labels.join(' ').toLowerCase() : '';
-  const label = String(item.label || '').toLowerCase();
-  const id = String(item.id || '');
-
-  let score = 0;
-
-  if (t.indexOf('패치') >= 0) score += 40;
-  if (t.indexOf('patch') >= 0) score += 30;
-
-  if (cat.indexOf('patch') >= 0 || cat.indexOf('patch_notes') >= 0) score += 40;
-
-  if (labels.indexOf('label_pc') >= 0) score += 25;
-  if (labels.indexOf('pc') >= 0 || label.indexOf('pc') >= 0) score += 10;
-
-  // 제재/공지/상점 같은 것 제외
-  if (t.indexOf('제재') >= 0 || t.indexOf('현황') >= 0) score -= 80;
-  if (t.indexOf('상점') >= 0) score -= 30;
-  if (t.indexOf('공지') >= 0) score -= 30;
-
-  // /news/20260106 처럼 날짜형(8자리)은 패치노트 고유 ID(4~6자리)보다 우선순위 낮춤
-  if (id && id.length >= 8) score -= 40;
-
-  // 날짜가 있으면 최신 가산
-  if (item.dateMs && item.dateMs > 0) {
-    const daysAgo = Math.max(0, (nowMs() - item.dateMs) / (24 * 60 * 60 * 1000));
-    if (daysAgo < 7) score += 15;
-    else if (daysAgo < 30) score += 8;
-  }
-
-  return score;
+function pubgBuildKoNewsUrl(newsId) {
+  const id = String(newsId || '').trim();
+  if (!id) return '';
+  // category param은 있어도 되고 없어도 됨. (있어도 상세로 열린다)
+  return 'https://pubg.com/ko/news/' + id + '?category=patch_notes&label=label_pc';
 }
 
-function buildKoNewsUrlFromId(id) {
-  const sid = String(id || '').trim();
-  if (!sid) return '';
-  return 'https://pubg.com/ko/news/' + sid;
-}
-
-function normalizeNewsUrl(baseUrl, urlOrPath, locale) {
-  const loc = String(locale || 'ko');
-  const u = String(urlOrPath || '').trim();
-  if (!u) return '';
-
-  // 이미 절대 URL
-  if (u.indexOf('http://') === 0 || u.indexOf('https://') === 0) {
-    // /news/<id> 이면 /ko/news/<id> 로 변환 시도
-    const m = u.match(/https?:\/\/[^\/]+\/news\/(\d{3,7})\b/i);
-    if (m && m[1]) return buildKoNewsUrlFromId(m[1]);
-    return u;
-  }
-
-  // 상대 경로
-  const abs = resolveUrl(baseUrl, u);
-
-  // /news/<id> 패턴 정규화
-  const m2 = String(abs).match(/https?:\/\/[^\/]+\/news\/(\d{3,7})\b/i);
-  if (m2 && m2[1]) return buildKoNewsUrlFromId(m2[1]);
-
-  // /ko/news/<id> 등은 그대로
-  return abs;
-}
-
-// 목록 HTML에서 "최신 패치노트" 기사 URL 후보를 뽑는다.
-// 우선순위:
-// 1) HTML에 직접 존재하는 /ko/news/<id>
-// 2) __NEXT_DATA__ JSON에서 title/id를 기반으로 patch note 후보 수집
-// 3) HTML 내 /news/<id> (4~7자리) → /ko/news/<id>로 정규화
-function extractCandidateNewsUrlsFromHtml(listHtml, baseUrl, locale) {
-  const urls = [];
+function pubgExtractCandidateIds(listHtml) {
   const html = String(listHtml || '');
-  const base = String(baseUrl || 'https://pubg.com');
+  const out = [];
 
-  // 1) 직접 /ko/news/<id>
-  const reKo = /\/ko\/news\/(\d{3,7})\b/ig;
-  let m;
-  while ((m = reKo.exec(html)) !== null) {
-    if (!m[1]) continue;
-    uniquePush(urls, 'https://pubg.com/ko/news/' + m[1]);
-    if (urls.length >= 15) break;
-  }
-  if (urls.length > 0) return urls;
-
-  // 2) __NEXT_DATA__
-  const nd = extractNextDataJson(html);
-  if (nd) {
-    const items = collectNewsItemsFromObject(nd).filter(isLikelyPatchNoteItem);
-    if (items && items.length > 0) {
-      items.sort((a, b) => {
-        const sa = scorePatchItem(a);
-        const sb = scorePatchItem(b);
-        if (sb !== sa) return sb - sa;
-        return (b.dateMs || 0) - (a.dateMs || 0);
-      });
-
-      for (let i = 0; i < items.length && urls.length < 15; i++) {
-        const it = items[i];
-        const id = String(it.id || '');
-        const url = it.url ? normalizeNewsUrl(base, it.url, locale) : (id ? buildKoNewsUrlFromId(id) : '');
-        if (!url) continue;
-        uniquePush(urls, url);
-      }
-    }
-  }
-  if (urls.length > 0) return urls;
-
-  // 3) /news/<id>  (8자리 날짜형은 제외)
-  const reNews = /\/news\/(\d{3,7})\b/ig;
-  while ((m = reNews.exec(html)) !== null) {
-    if (!m[1]) continue;
-    uniquePush(urls, buildKoNewsUrlFromId(m[1]));
-    if (urls.length >= 15) break;
+  function addCandidate(id, rawUrl, score, reason, ctxLen) {
+    const sid = String(id || '').trim();
+    if (!sid) return;
+    const url = rawUrl ? String(rawUrl) : '';
+    out.push({ id: sid, url: url, score: score, reason: reason || '', ctxLen: ctxLen || 0 });
   }
 
-  return urls;
-}
-
-
-
-function cleanPubgTitle(title) {
-  const t = String(title || '').trim();
-  if (!t) return '';
-  // 예: "패치 노트 - 업데이트 39.2 - 뉴스 - PUBG: 배틀그라운드"
-  return t
-    .replace(/\s+-\s+뉴스\s+-\s+PUBG[:：]\s*배틀그라운드\s*$/i, '')
-    .replace(/\s+-\s+NEWS\s+-\s+PUBG[:：]\s*BATTLEGROUNDS\s*$/i, '')
-    .trim();
-}
-
-function extractPatchBodyOnly(text) {
-  const lines = String(text || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-  if (lines.length === 0) return '';
-
-  // 시작 지점 찾기
-  let startIdx = 0;
-  const startPatterns = [
-    /^###\s*패치\s*노트/i,
-    /^##\s*패치\s*노트/i,
-    /^패치\s*노트\s*-/i,
-    /^Patch\s*Notes/i,
-    /^###\s*Patch\s*Notes/i,
+  // 1) /ko/news/<id> or /news/<id>
+  const patterns = [
+    /\/ko\/news\/(\d{4,})(\?[^"'<\s]*)?/ig,
+    /\/news\/(\d{4,})(\?[^"'<\s]*)?/ig,
   ];
 
-  for (let i = 0; i < lines.length; i++) {
-    const ln = lines[i];
-    for (let p = 0; p < startPatterns.length; p++) {
-      if (startPatterns[p].test(ln)) {
-        startIdx = i;
-        i = lines.length; // break outer
-        break;
-      }
+  for (let pi = 0; pi < patterns.length; pi++) {
+    const re = patterns[pi];
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      const id = m[1];
+      const hit = m[0];
+      const pos = m.index || 0;
+      const ctx = html.slice(Math.max(0, pos - 220), Math.min(html.length, pos + 220)).toLowerCase();
+
+      let score = 0;
+      if (ctx.indexOf('patch_notes') >= 0) score += 80;
+      if (ctx.indexOf('patch') >= 0) score += 15;
+      if (ctx.indexOf('패치') >= 0) score += 20;
+      if (ctx.indexOf('업데이트') >= 0) score += 15;
+      if (ctx.indexOf('label_pc') >= 0) score += 20;
+      if (ctx.indexOf('"pc"') >= 0 || ctx.indexOf(' pc ') >= 0) score += 5;
+
+      if (ctx.indexOf('공지') >= 0 || ctx.indexOf('notice') >= 0 || ctx.indexOf('announcement') >= 0) score -= 30;
+      if (ctx.indexOf('제재') >= 0 || ctx.indexOf('ban') >= 0 || ctx.indexOf('sanction') >= 0) score -= 40;
+
+      addCandidate(id, hit, score, 'path', ctx.length);
     }
   }
 
-  // 끝(푸터) 자르기
-  let endIdx = lines.length;
-  const endMarkers = [
-    /개인정보\s*처리방침/i,
-    /서비스\s*이용약관/i,
-    /운영정책/i,
-    /^©\s*\d{4}/i,
-    /KRAFTON,\s*INC/i,
-    /쿠키\s*설정/i,
-  ];
-  for (let i = startIdx; i < lines.length; i++) {
-    const ln = lines[i];
-    for (let p = 0; p < endMarkers.length; p++) {
-      if (endMarkers[p].test(ln)) {
-        endIdx = i;
-        i = lines.length;
-        break;
-      }
+  // 2) JSON 형태: "category":"patch_notes" 근처 id 추출
+  const reJson = /"category"\s*:\s*"patch_notes"[\s\S]{0,260}?"id"\s*:\s*"?(\d{4,})"?/ig;
+  let mj;
+  while ((mj = reJson.exec(html)) !== null) {
+    addCandidate(mj[1], '', 90, 'json_category_first', 260);
+  }
+
+  const reJson2 = /"id"\s*:\s*"?(\d{4,})"?[\s\S]{0,260}?"category"\s*:\s*"patch_notes"/ig;
+  while ((mj = reJson2.exec(html)) !== null) {
+    addCandidate(mj[1], '', 90, 'json_id_first', 260);
+  }
+
+  // 3) "patch_notes" 페이지에서 흔히 나오는 숫자 id 리스트 (백업)
+  const reIdLoose = /\b(\d{4,})\b/g;
+  // 너무 많은 숫자(연도/시간)까지 다 담기면 오염되므로, patch_notes가 있는 근처만 스캔
+  const idx = html.toLowerCase().indexOf('patch_notes');
+  if (idx >= 0) {
+    const slice = html.slice(Math.max(0, idx - 2000), Math.min(html.length, idx + 20000));
+    let ml;
+    while ((ml = reIdLoose.exec(slice)) !== null) {
+      const id = ml[1];
+      if (!id) continue;
+      if (id.length < 4) continue;
+      // 너무 짧은 연도(2026)만 나오는 것 제외하려고 5자리 이상만 우선
+      let score = (id.length >= 5) ? 10 : 0;
+      addCandidate(id, '', score, 'loose_near_patch_notes', 0);
+      if (out.length > 500) break;
     }
   }
 
-  const body = lines.slice(startIdx, endIdx).join('\n').trim();
-  return body;
+  // 중복 제거 + 최고 점수 유지
+  const best = new Map(); // id -> cand
+  for (let i = 0; i < out.length; i++) {
+    const c = out[i];
+    const id = String(c.id);
+    const prev = best.get(id);
+    if (!prev || (c.score > prev.score)) best.set(id, c);
+  }
+
+  const arr = Array.from(best.values());
+  arr.sort((a, b) => b.score - a.score);
+
+  return arr.slice(0, 25);
 }
 
-function parsePatchNoteFromArticle(articleHtml, url) {
-  const html = String(articleHtml || '');
-  const baseUrl = String(url || 'https://pubg.com');
+function pubgParsePatchNoteFromArticle(fullHtml, finalUrl) {
+  const baseUrl = finalUrl || 'https://pubg.com/ko/news';
 
-  // meta title 추출
-  let title = '';
-  const mTitle = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i)
-    || html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  if (mTitle && mTitle[1]) title = htmlDecode(mTitle[1]);
+  const title =
+    pubgExtractMetaContent(fullHtml, 'property', 'og:title') ||
+    pubgExtractMetaContent(fullHtml, 'name', 'twitter:title') ||
+    (function () {
+      const m = String(fullHtml || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      return m ? pubgDecodeHtmlEntities(String(m[1] || '').replace(/\s+/g, ' ').trim()) : '';
+    })();
 
-  // 본문 후보: article → main → body
-  let contentHtml = '';
-  const mArticle = html.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
-  if (mArticle && mArticle[1]) contentHtml = mArticle[1];
+  const imageUrl =
+    pubgExtractMetaContent(fullHtml, 'property', 'og:image') ||
+    pubgExtractMetaContent(fullHtml, 'name', 'twitter:image') ||
+    '';
 
-  if (!contentHtml) {
-    const mMain = html.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
-    if (mMain && mMain[1]) contentHtml = mMain[1];
-  }
-  if (!contentHtml) {
-    const mBody = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-    if (mBody && mBody[1]) contentHtml = mBody[1];
-    else contentHtml = html;
-  }
+  const published =
+    pubgExtractMetaContent(fullHtml, 'property', 'article:published_time') ||
+    pubgExtractMetaContent(fullHtml, 'name', 'pubdate') ||
+    pubgExtractMetaContent(fullHtml, 'name', 'publish-date') ||
+    '';
 
-  // 텍스트화
-  let contentText = stripTagsToText(contentHtml);
+  const mainHtml = pubgExtractMainArticleHtml(fullHtml);
+  const contentText = pubgStripTagsToText(mainHtml);
 
-  // 목록/네비가 섞이는 경우가 많아서, 가능한 patch 본문만 추출
-  const bodyOnly = extractPatchBodyOnly(contentText);
-  if (bodyOnly) contentText = bodyOnly;
-
-  // 제목 정리
-  title = cleanPubgTitle(title);
-
-  // 이미지 추출: article/main/body 안에서 img src
   const imageUrls = [];
-  const imgRe = /<img[^>]+src=["']([^"']+)["'][^>]*>/ig;
-  let m;
-  while ((m = imgRe.exec(contentHtml)) !== null) {
-    const src = String(m[1] || '').trim();
-    if (!src) continue;
-    const abs = resolveUrl(baseUrl, src);
-    if (!abs) continue;
-    // thumb/아이콘류는 제외
-    if (/\/favicon\.ico/i.test(abs)) continue;
-    uniquePush(imageUrls, abs);
-    if (imageUrls.length >= 6) break;
-  }
+  const bodyImg = pubgExtractUrlsByTagAttr(mainHtml, 'img', 'src', baseUrl, 8);
+  for (let i = 0; i < bodyImg.length; i++) pubgUniquePush(imageUrls, bodyImg[i]);
 
-  // 링크(참고용) 추출: 기사 본문 내 a href
-  const linkUrls = [];
-  const aRe = /<a[^>]+href=["']([^"']+)["'][^>]*>/ig;
-  while ((m = aRe.exec(contentHtml)) !== null) {
-    const href = String(m[1] || '').trim();
-    if (!href) continue;
-    if (href.indexOf('#') === 0) continue;
-    const abs = resolveUrl(baseUrl, href);
-    if (!abs) continue;
-    uniquePush(linkUrls, abs);
-    if (linkUrls.length >= 6) break;
-  }
+  const bodyImg2 = pubgExtractUrlsByTagAttr(mainHtml, 'img', 'data-src', baseUrl, 8);
+  for (let i = 0; i < bodyImg2.length; i++) pubgUniquePush(imageUrls, bodyImg2[i]);
+
+  if (imageUrl) pubgUniquePush(imageUrls, pubgResolveUrl(baseUrl, imageUrl));
+
+  const videoUrls = [];
+  const ifr = pubgExtractUrlsByTagAttr(mainHtml, 'iframe', 'src', baseUrl, 4);
+  for (let i = 0; i < ifr.length; i++) pubgUniquePush(videoUrls, ifr[i]);
+
+  const vid = pubgExtractUrlsByTagAttr(mainHtml, 'video', 'src', baseUrl, 4);
+  for (let i = 0; i < vid.length; i++) pubgUniquePush(videoUrls, vid[i]);
 
   return {
-    title: title || '',
-    url: baseUrl,
-    contentText: contentText || '',
+    title: title,
+    url: String(finalUrl || ''),
+    publishedText: published,
+    imageUrl: imageUrl ? pubgResolveUrl(baseUrl, imageUrl) : '',
     imageUrls: imageUrls,
-    linkUrls: linkUrls,
+    videoUrls: videoUrls,
+    contentText: contentText,
   };
 }
 
-
-
 async function fetchLatestPubgPatchNote(options) {
   const opt = options || {};
-  const maxChars = (opt && typeof opt.maxChars === 'number') ? opt.maxChars : 6000;
+  const wantChars = opt.maxChars && !isNaN(opt.maxChars) ? parseInt(opt.maxChars, 10) : PUBG_DEFAULT_EXCERPT_CHARS;
 
-  // 목록 URL을 여러 개 시도 (구조가 바뀌거나 지역/라벨 파라미터가 다르게 동작할 수 있음)
-  const listUrls = [
-    PUBG_PATCH_LIST_URL,
-    PUBG_PATCH_LIST_URL_ALT,
-    PUBG_PATCH_LIST_URL_ALT2,
-  ].filter(Boolean);
+  const cacheKey = 'pc_patch_' + String(wantChars);
+  const now = pubgNowMs();
+  if (pubgPatchCache.data && pubgPatchCache.key === cacheKey && pubgPatchCache.fetchedAtMs && (now - pubgPatchCache.fetchedAtMs) < PUBG_CACHE_TTL_MS) {
+    return pubgPatchCache.data;
+  }
 
-  let lastError = null;
+  // 1) 목록 페이지(PC) 먼저, 실패 시 fallback
+  let listHtml = '';
+  let listUrlUsed = PUBG_PATCH_LIST_URL;
 
-  for (let u = 0; u < listUrls.length; u++) {
-    const listUrl = listUrls[u];
+  try {
+    const listRes = await fetchHtmlWithCache(PUBG_PATCH_LIST_URL, PUBG_HTTP_TIMEOUT_MS);
+    listHtml = listRes && listRes.html ? listRes.html : '';
+  } catch (e) {
+    listHtml = '';
+  }
 
-    const listRes = await fetchHtmlWithCache(listUrl, 'pubg_list:' + listUrl, 10 * 60 * 1000);
-    if (!listRes || !listRes.ok || !listRes.html) {
-      lastError = new Error('PUBG list fetch failed: ' + listUrl);
-      continue;
-    }
+  if (!listHtml || listHtml.length < 500) {
+    listUrlUsed = PUBG_PATCH_LIST_URL_FALLBACK;
+    const listRes2 = await fetchHtmlWithCache(PUBG_PATCH_LIST_URL_FALLBACK, PUBG_HTTP_TIMEOUT_MS);
+    listHtml = listRes2 && listRes2.html ? listRes2.html : '';
+  }
 
-    const candidateUrls = extractCandidateNewsUrlsFromHtml(listRes.html, listUrl, 'ko') || [];
-    debugPubg('list_ok url=' + listUrl + ' candidates=' + candidateUrls.length);
+  if (!listHtml || listHtml.length < 500) throw new Error('PUBG list fetch failed');
 
-    if (!candidateUrls || candidateUrls.length === 0) {
-      lastError = new Error('PUBG patch link not found');
-      continue;
-    }
+  const candidates = pubgExtractCandidateIds(listHtml);
+  if (!candidates || candidates.length === 0) throw new Error('PUBG patch link not found');
 
-    const tryMax = Math.min(candidateUrls.length, 10);
+  pubgLog('[PUBG] listUrlUsed=', listUrlUsed, 'candCount=', candidates.length);
 
-    for (let i = 0; i < tryMax; i++) {
-      const candUrl = candidateUrls[i];
-      debugPubg('try_candidate[' + i + '] url=' + candUrl);
+  let lastErr = null;
 
-      const artRes = await fetchHtmlWithCache(candUrl, 'pubg_article:' + candUrl, 30 * 60 * 1000);
-      if (!artRes || !artRes.ok || !artRes.html) {
-        lastError = new Error('PUBG article fetch failed: ' + candUrl);
+  for (let i = 0; i < candidates.length; i++) {
+    const cand = candidates[i];
+    const koUrl = pubgBuildKoNewsUrl(cand.id);
+    if (!koUrl) continue;
+
+    pubgLog('try_candidate[' + i + ']', 'id=' + cand.id, 'score=' + cand.score, 'reason=' + cand.reason, 'url=' + koUrl);
+
+    try {
+      const articleRes = await fetchHtmlWithCache(koUrl, PUBG_HTTP_TIMEOUT_MS);
+      const html = articleRes && articleRes.html ? articleRes.html : '';
+
+      const parsed = pubgParsePatchNoteFromArticle(html, koUrl);
+      const title = String(parsed.title || '').trim();
+      const contentText = String(parsed.contentText || '').trim();
+
+      if (!pubgIsLikelyPatchNote(title, contentText)) {
+        pubgLog('candidate_skip', 'reason=not_patch_body', 'textLen=' + contentText.length, 'title=' + safeShort(title, 80));
+        lastErr = new Error('candidate not patch body');
         continue;
       }
 
-      const parsed = parsePatchNoteFromArticle(artRes.html, candUrl);
-      const fullText = String(parsed && parsed.contentText ? parsed.contentText : '').trim();
+      // excerpt
+      let excerpt = contentText;
+      if (wantChars > 0 && excerpt.length > wantChars) excerpt = excerpt.slice(0, wantChars) + '\n\n(이하 생략)';
 
-      if (!isProbablyPatchBodyText(fullText)) {
-        debugPubg('candidate_skip reason=not_patch_body textLen=' + fullText.length);
-        lastError = new Error('candidate not patch body');
-        continue;
-      }
-
-      const cropped = (maxChars > 0 && fullText.length > maxChars) ? fullText.slice(0, maxChars) : fullText;
-
-      return {
-        title: String((parsed && parsed.title) ? parsed.title : '').trim(),
-        articleUrl: candUrl,
-        contentText: cropped,
-        imageUrls: (parsed && parsed.imageUrls) ? parsed.imageUrls : [],
-        linkUrls: (parsed && parsed.linkUrls) ? parsed.linkUrls : [],
+      const out = {
+        title: title,
+        url: koUrl,
+        publishedText: parsed.publishedText,
+        imageUrl: parsed.imageUrl,
+        imageUrls: parsed.imageUrls || [],
+        videoUrls: parsed.videoUrls || [],
+        contentText: contentText,
+        excerptText: excerpt,
       };
+
+      pubgPatchCache.key = cacheKey;
+      pubgPatchCache.fetchedAtMs = pubgNowMs();
+      pubgPatchCache.data = out;
+
+      return out;
+    } catch (e) {
+      lastErr = e;
+      pubgLog('candidate_error', 'id=' + cand.id, (e && e.message ? e.message : e));
     }
   }
 
-  throw lastError || new Error('PUBG patch link not found');
+  throw (lastErr || new Error('PUBG patch note not found'));
 }
-
 
 async function fetchLatestPubgPatchNoteSummary(options) {
   const opt = options || {};
   const wantFull = opt && opt.full === true;
-  const maxChars = wantFull ? PUBG_FULL_EXCERPT_CHARS : PUBG_DEFAULT_EXCERPT_CHARS;
 
+  const maxChars = wantFull ? PUBG_FULL_EXCERPT_CHARS : PUBG_DEFAULT_EXCERPT_CHARS;
   const data = await fetchLatestPubgPatchNote({ maxChars: maxChars });
 
-  // Summary via AI (if available). Use only a slice to limit cost.
   const rawText = String(data.contentText || '').trim();
-  const forAi = rawText.length > 3500 ? rawText.slice(0, 3500) : rawText;
+  const forAi = rawText.length > 5000 ? rawText.slice(0, 5000) : rawText;
 
   let summaryText = '';
+
   if (OPENAI_API_KEY) {
     const instructionText =
-      '너는 게임 패치노트 요약 봇이다. ' +
-      '반드시 한국어로만 답한다. ' +
-      '원문에 있는 내용만 요약한다. 추측하지 않는다. ' +
-      '핵심만 정리한다. ' +
-      '불릿 5~10개로 요약한다. ' +
-      '패치 항목이 많으면 섹션별로 묶는다.';
+      '너는 PUBG 패치노트 요약 봇이다. ' +
+      '무조건 한국어로 답한다. ' +
+      '중요 변경점 위주로 짧고 정확하게 쓴다. ' +
+      '불릿 6~12개로 요약하고, 필요하면 섹션으로 나눠라.';
 
     const prompt =
-      '아래는 배틀그라운드(PUBG) 패치노트 원문 일부다.\n' +
-      '다음 규칙으로 요약해라:\n' +
-      '- 중요한 변경점 우선\n' +
-      '- 수치/밸런스/버그수정/신규콘텐츠 구분\n' +
-      '- 애매하면 원문 그대로 쓰지 말고 짧게 표현\n\n' +
+      '아래는 PUBG 패치노트 원문(일부 또는 전체)이다.\n' +
+      '규칙:\n' +
+      '- 수치/밸런스/무기/맵/시스템/버그수정/신규콘텐츠를 가능하면 구분\n' +
+      '- 중요도 높은 것부터\n' +
+      '- 내용이 없으면 없다고 말해라(억지로 만들지 말 것)\n\n' +
       forAi;
 
     const aiResult = await callOpenAIResponses(instructionText, prompt);
@@ -1885,15 +1220,14 @@ async function fetchLatestPubgPatchNoteSummary(options) {
   }
 
   if (!summaryText) {
-    // fallback: 짧은 발췌
-    const fallback = rawText.length > 800 ? rawText.slice(0, 800) + '...' : rawText;
+    // fallback: 발췌 앞부분
+    const fallback = rawText.length > 1200 ? rawText.slice(0, 1200) + '...' : rawText;
     summaryText = fallback || '요약 실패';
   }
 
   return {
     title: data.title,
     url: data.url,
-    listUrl: data.listUrl || PUBG_PATCH_LIST_URL,
     publishedText: data.publishedText,
     imageUrl: data.imageUrl,
     imageUrls: data.imageUrls,
@@ -1903,7 +1237,6 @@ async function fetchLatestPubgPatchNoteSummary(options) {
     contentText: data.contentText,
   };
 }
-
 // ---- End PUBG Patch Notes Helper Functions ----
 
 // ---- PartyBeast Room Renumber Implementation ----
@@ -2150,91 +1483,79 @@ client.on('message', async (message) => {
   }
 
   // PUBG 최신 패치노트 요약
+      // PUBG 최신 패치노트 요약/원문 출력
+    // 사용:
+    //  - !배그패치          : 요약 + 발췌
+    //  - !배그패치 전체     : 요약 + 더 긴 발췌
+    //  - !배그패치 원문     : 요약 + 원문(길면 일부만)
     if (command === '배그패치') {
-    // 사용법:
-    // !배그패치            : 요약 + 본문 일부(기본)
-    // !배그패치 원문       : 원문 기반으로 본문 더 길게
-    // !배그패치 전체       : 가능한 범위 내에서 더 길게(최대 15000자)
-    const mode = args && args.length > 0 ? String(args[0] || '').trim() : '';
-    const wantRaw = (mode === '원문');
-    const wantFull = (mode === '전체');
+      const wantFull = (args.indexOf('전체') >= 0);
+      const wantRaw = (args.indexOf('원문') >= 0);
 
-    try {
-      const info = await fetchLatestPubgPatchNoteSummary({ full: wantFull || wantRaw });
+      try {
+        const result = await fetchLatestPubgPatchNoteSummary({ full: (wantFull || wantRaw) });
 
-      const embed = new Discord.MessageEmbed()
-        .setTitle(info.title || 'PUBG 최신 패치노트')
-        .setURL(info.url || PUBG_PATCH_LIST_URL)
-        .setColor('#2ecc71')
-        .setTimestamp();
+        let msg = '';
+        msg += 'NEWS - PUBG: BATTLEGROUNDS\n';
+        msg += '요약\n';
+        msg += '## ' + (result.title || 'PUBG 패치노트') + '\n';
+        if (result.publishedText) msg += '(게시: ' + result.publishedText + ')\n';
+        msg += '\n' + (result.summary || '') + '\n\n';
+        msg += '자세히: ' + result.url + '\n';
 
-      if (info.publishedText) {
-        embed.addField('게시일', safeShort(info.publishedText, 100), false);
+        await sendLongText(message.channel, msg);
+
+        // 이미지/영상 링크 (있으면)
+        const extraLinks = [];
+        if (result.imageUrl) extraLinks.push(result.imageUrl);
+
+        if (result.imageUrls && result.imageUrls.length > 0) {
+          for (let i = 0; i < result.imageUrls.length && extraLinks.length < 3; i++) {
+            const u = result.imageUrls[i];
+            if (u && extraLinks.indexOf(u) < 0) extraLinks.push(u);
+          }
+        }
+
+        if (result.videoUrls && result.videoUrls.length > 0) {
+          for (let j = 0; j < result.videoUrls.length && extraLinks.length < 5; j++) {
+            const v = result.videoUrls[j];
+            if (v && extraLinks.indexOf(v) < 0) extraLinks.push(v);
+          }
+        }
+
+        if (extraLinks.length > 0) {
+          let linkMsg = '추가 링크\n';
+          for (let k = 0; k < extraLinks.length; k++) linkMsg += extraLinks[k] + '\n';
+          await sendLongText(message.channel, linkMsg);
+        }
+
+        if (wantRaw) {
+          let body = String(result.contentText || '').trim();
+          if (!body) {
+            await message.channel.send('원문 추출 실패');
+            return;
+          }
+
+          // 디스코드 스팸 방지: 너무 길면 제한
+          if (body.length > 25000) {
+            body = body.slice(0, 25000) + '\n\n(원문이 너무 길어서 일부만 표시했습니다.)';
+          }
+
+          await sendLongText(message.channel, body);
+          return;
+        }
+
+        // 기본/전체는 발췌 출력
+        const excerpt = String(result.excerptText || '').trim();
+        if (excerpt) await sendLongText(message.channel, excerpt);
+        else await message.channel.send('발췌 내용이 없습니다.');
+
+      } catch (e) {
+        console.log('[PUBG_PATCH_ERROR]', e && e.stack ? e.stack : e);
+        await message.channel.send('배그 패치노트를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
       }
-
-      if (info.summary) {
-        embed.addField('요약', safeShort(info.summary, 1000), false);
-      }
-
-      // 이미지: embed에는 1개만 넣고, 추가 이미지 링크는 별도 안내
-      const img1 = (info.imageUrls && info.imageUrls.length > 0) ? info.imageUrls[0] : (info.imageUrl || '');
-      if (img1) embed.setImage(img1);
-
-      // 영상/추가 이미지 링크
-      const videos = (info.videoUrls && info.videoUrls.length > 0) ? info.videoUrls.slice(0, 2) : [];
-      const images = (info.imageUrls && info.imageUrls.length > 1) ? info.imageUrls.slice(1, 4) : [];
-
-      if (videos.length > 0) {
-        embed.addField('영상', safeShort(videos.join('\n'), 1000), false);
-      }
-      if (images.length > 0) {
-        embed.addField('추가 이미지', safeShort(images.join('\n'), 1000), false);
-      }
-
-      await message.channel.send(embed);
-
-      // 본문 출력(링크 말고 내용)
-      // 기본: excerptText (4500자). 원문/전체: 더 길게. Discord 제한 때문에 자동으로 끊는다.
-      let body = '';
-      if (wantRaw || wantFull) body = String(info.contentText || '').trim();
-      else body = String(info.excerptText || '').trim();
-
-      if (!body) {
-        await message.channel.send('패치노트 본문을 추출하지 못했다. 링크로 확인해줘: ' + (info.url || PUBG_PATCH_LIST_URL));
-        return;
-      }
-
-      // 너무 길면 잘라서 전송(과부화/스팸 방지)
-      const hardCap = wantFull ? PUBG_FULL_EXCERPT_CHARS : (wantRaw ? PUBG_FULL_EXCERPT_CHARS : PUBG_DEFAULT_EXCERPT_CHARS);
-      if (body.length > hardCap) {
-        body = body.slice(0, hardCap) + '\n\n(이하 생략)';
-      }
-
-      // 메시지 분할 전송 + 최대 메시지수 제한
-      const LIMIT = 1900;
-      const MAX_MSGS = wantFull ? 10 : 6;
-      let sent = 0;
-      let idx = 0;
-
-      while (idx < body.length && sent < MAX_MSGS) {
-        const chunk = body.slice(idx, idx + LIMIT);
-        idx += LIMIT;
-        await message.channel.send(chunk);
-        sent++;
-      }
-
-      if (idx < body.length) {
-        await message.channel.send('(본문이 너무 길어서 일부만 보냈다. 더 보려면 !배그패치 전체)');
-      }
-
-      return;
-    } catch (e) {
-      console.error('[PUBG_PATCH_ERROR]', e && e.stack ? e.stack : e);
-      await message.reply('배그 패치노트 가져오기 실패. 잠시 후 다시 시도해줘.');
       return;
     }
-  }
-
 
   // !복귀: 마지막 !해산으로 이동된 인원들을 대기실로 이동
   if (command === '복귀') {
