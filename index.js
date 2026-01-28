@@ -66,6 +66,10 @@ for (let i = 0; i < MANAGED_ROOM_CATEGORIES.length; i++) {
   managedCategoryMap.set(String(MANAGED_ROOM_CATEGORIES[i].categoryId), MANAGED_ROOM_CATEGORIES[i]);
 }
 
+// ---- 전부이동 상태 관리 ----
+const moveAllStateByUser = new Map(); // userId -> { guildId, sourceChannelId, createdAtMs }
+const MOVEALL_TIMEOUT_MS = 60000;     // 60초 안에 목적 채널 이름을 받아야 유효
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -90,7 +94,7 @@ function getUserNicknameOnly(message) {
   return nick ? nick : String(display).trim();
 }
 
-// 팀 셔플용: Fisher–Yates 셔플 (기존 sort(Math.random)보다 훨씬 랜덤성 좋음)
+// 팀 셔플용: Fisher–Yates 셔플
 function shuffleArray(inputArray) {
   const arr = inputArray.slice();
   for (let i = arr.length - 1; i > 0; i--) {
@@ -100,6 +104,106 @@ function shuffleArray(inputArray) {
     arr[j] = tmp;
   }
   return arr;
+}
+
+// members 배열을 팀 단위로 나누기
+function buildTeamsFromMembersArray(membersArray, teamSize) {
+  const teams = [];
+  for (let i = 0; i < membersArray.length; i += teamSize) {
+    const teamMembers = membersArray.slice(i, i + teamSize);
+    teams.push(teamMembers);
+  }
+  return teams;
+}
+
+// 이전 팀(latestTeams)과 새 팀(teamsMembers)이 얼마나 비슷한지 평가
+// 반환: { ratio } - 1.0에 가까울수록 "이전 팀과 많이 비슷", 0에 가까울수록 "많이 다름"
+function evaluateTeamDifference(prevTeams, newTeamsMembers) {
+  if (!prevTeams || !Array.isArray(prevTeams) || prevTeams.length === 0) {
+    // 비교 기준이 없으면 "완전 새로"라고 보고 ratio 0.0 취급
+    return { ratio: 0.0 };
+  }
+
+  // 새 팀을 ID 배열로 변환
+  const newTeamsIds = [];
+  const memberSet = new Set();
+  for (let i = 0; i < newTeamsMembers.length; i++) {
+    const team = newTeamsMembers[i];
+    const ids = [];
+    for (let j = 0; j < team.length; j++) {
+      const id = String(team[j].id);
+      ids.push(id);
+      memberSet.add(id);
+    }
+    newTeamsIds.push(ids);
+  }
+
+  const prevTeamsIds = [];
+  for (let i = 0; i < prevTeams.length; i++) {
+    const t = prevTeams[i];
+    const ids = [];
+    for (let j = 0; j < t.length; j++) {
+      ids.push(String(t[j]));
+    }
+    prevTeamsIds.push(ids);
+  }
+
+  if (newTeamsIds.length === 0 || memberSet.size === 0) {
+    return { ratio: 0.0 };
+  }
+
+  // 멤버별 이전 팀 인덱스
+  const prevTeamIndexByMember = {};
+  for (let i = 0; i < prevTeamsIds.length; i++) {
+    const team = prevTeamsIds[i];
+    for (let j = 0; j < team.length; j++) {
+      prevTeamIndexByMember[team[j]] = i;
+    }
+  }
+
+  const prevTeamCount = prevTeamsIds.length;
+  const newTeamCount = newTeamsIds.length;
+
+  if (prevTeamCount === 0 || newTeamCount === 0) {
+    return { ratio: 0.0 };
+  }
+
+  // overlap[prevTeamIndex][newTeamIndex] = 겹치는 인원 수
+  const overlap = [];
+  for (let i = 0; i < prevTeamCount; i++) {
+    const row = [];
+    for (let j = 0; j < newTeamCount; j++) row.push(0);
+    overlap.push(row);
+  }
+
+  for (let j = 0; j < newTeamsIds.length; j++) {
+    const newTeam = newTeamsIds[j];
+    for (let k = 0; k < newTeam.length; k++) {
+      const id = newTeam[k];
+      const pi = prevTeamIndexByMember[id];
+      if (pi === 0 || (pi && pi >= 0)) {
+        overlap[pi][j] = overlap[pi][j] + 1;
+      }
+    }
+  }
+
+  let totalSimilarMembers = 0;
+  const totalMembers = memberSet.size;
+
+  for (let j = 0; j < newTeamCount; j++) {
+    const newSize = newTeamsIds[j].length;
+    if (newSize === 0) continue;
+
+    let maxOverlap = 0;
+    for (let i = 0; i < prevTeamCount; i++) {
+      if (overlap[i][j] > maxOverlap) maxOverlap = overlap[i][j];
+    }
+    // 각 새 팀에서 "이전 팀과 가장 많이 겹치는 인원 수"를 유사도로 본다.
+    totalSimilarMembers += maxOverlap;
+  }
+
+  const ratio = totalMembers > 0 ? (totalSimilarMembers / totalMembers) : 0.0;
+  return { ratio: ratio };
 }
 
 // sheet job serialize
@@ -402,9 +506,6 @@ async function fetchAllMessagesFromChannelText(channel) {
 }
 
 async function runBackup(invokingMessage) {
-  // 백업 결과는 기본적으로 "명령어를 친 사람"에게만 DM으로 알린다.
-  // 일반 메시지 기반 명령어는 'ephemeral(사용자에게만 보이기)'가 불가능하므로,
-  // DM이 막힌 경우에만 채널에 잠깐 표시 후 삭제한다.
   async function notify(text) {
     if (!invokingMessage || !invokingMessage.author) return;
 
@@ -412,7 +513,6 @@ async function runBackup(invokingMessage) {
       await invokingMessage.author.send(String(text));
       return;
     } catch (e) {
-      // DM 불가: 채널에 임시 표시 후 삭제(가능하면)
       try {
         const tmp = await invokingMessage.reply(String(text) + '\n(DM 수신이 차단되어 채널에 잠깐 표시됩니다.)');
         if (tmp && tmp.delete) {
@@ -424,7 +524,6 @@ async function runBackup(invokingMessage) {
     }
   }
 
-  // 명령 메시지는 정리(가능하면)
   try { await invokingMessage.delete(); } catch (e) {}
 
   if (backupRunning) {
@@ -817,7 +916,6 @@ async function renumberCategoryRooms(guildId, categoryId, why) {
   }
 
   if (targets.length <= 1) {
-    // 1개만 남았으면 1번으로 강제
     if (targets.length === 1) {
       const desired = prefixText + '1';
       if (String(targets[0].name) !== desired) {
@@ -832,14 +930,12 @@ async function renumberCategoryRooms(guildId, categoryId, why) {
     return;
   }
 
-  // 중요: 파티비스트가 빈번호로 생성해도, 오래된 방이 1번이 되게 "생성시간" 기준으로 정렬
   targets.sort((a, b) => {
     const ta = a.createdTimestamp || 0;
     const tb = b.createdTimestamp || 0;
     return ta - tb;
   });
 
-  // 원하는 이름 계산
   const plan = [];
   for (let i = 0; i < targets.length; i++) {
     const desired = prefixText + String(i + 1);
@@ -947,7 +1043,83 @@ client.on('message', async (message) => {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
-  // 기존: 타겟 채널 양식 기록
+  // ---- 전부이동: 목적 채널 이름 입력 단계 처리 ----
+  const pendingMove = moveAllStateByUser.get(String(message.author.id));
+  if (pendingMove && message.guild && String(message.guild.id) === String(pendingMove.guildId)) {
+    if (message.content && !message.content.startsWith(prefix)) {
+      const now = nowMs();
+      if (now - pendingMove.createdAtMs > MOVEALL_TIMEOUT_MS) {
+        moveAllStateByUser.delete(String(message.author.id));
+        try { await message.reply('전부이동 시간이 초과되었습니다. 다시 !전부이동 명령을 사용해 주세요.'); } catch (e) {}
+        return;
+      }
+
+      const guild = message.guild;
+      const sourceChannel = guild.channels.cache.get(String(pendingMove.sourceChannelId));
+      if (!sourceChannel || sourceChannel.type !== 'voice') {
+        moveAllStateByUser.delete(String(message.author.id));
+        try { await message.reply('전부이동 실패: 원래 음성 채널을 찾지 못했습니다.'); } catch (e) {}
+        return;
+      }
+
+      const raw = String(message.content).trim();
+      let targetChannel = null;
+
+      const mentionMatch = raw.match(/^<#!?(\d+)>$/);
+      if (mentionMatch) {
+        const cid = mentionMatch[1];
+        const ch = guild.channels.cache.get(String(cid));
+        if (ch && ch.type === 'voice') targetChannel = ch;
+      }
+
+      if (!targetChannel && /^[0-9]+$/.test(raw)) {
+        const ch = guild.channels.cache.get(String(raw));
+        if (ch && ch.type === 'voice') targetChannel = ch;
+      }
+
+      if (!targetChannel) {
+        const lower = raw.toLowerCase();
+        targetChannel = guild.channels.cache.find((ch) => {
+          if (!ch || ch.type !== 'voice') return false;
+          const name = String(ch.name || '').toLowerCase();
+          return name === lower;
+        });
+      }
+
+      if (!targetChannel) {
+        try { await message.reply('전부이동 실패: 해당 이름의 음성 채널을 찾지 못했습니다. 다시 !전부이동 명령을 사용해 주세요.'); } catch (e) {}
+        moveAllStateByUser.delete(String(message.author.id));
+        return;
+      }
+
+      if (String(targetChannel.id) === String(sourceChannel.id)) {
+        try { await message.reply('이미 그 음성 채널에 있습니다.'); } catch (e) {}
+        moveAllStateByUser.delete(String(message.author.id));
+        return;
+      }
+
+      const members = sourceChannel.members.array();
+      let movedCount = 0;
+
+      for (let i = 0; i < members.length; i++) {
+        const mem = members[i];
+        if (!mem || !mem.voice || !mem.voice.channel) continue;
+        try {
+          await mem.voice.setChannel(targetChannel);
+          movedCount++;
+        } catch (e) {
+          console.error('[MoveAll] move failed:', mem.id, e && e.message ? e.message : e);
+        }
+      }
+
+      moveAllStateByUser.delete(String(message.author.id));
+      try {
+        await message.reply('전부이동 완료: ' + movedCount + '명을 "' + String(targetChannel.name || '') + '" 채널로 이동했습니다.');
+      } catch (e) {}
+      return;
+    }
+  }
+
   if (isTargetChannelOrThread(message)) {
     console.log(
       '[MSG] recv',
@@ -959,19 +1131,16 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
-  // AI 대화: 인증된 채널에서만, 명령어 제외
   if (message.guild && isAiChannelOrThread(message) && (!message.content || !message.content.startsWith(prefix))) {
     enqueueAiJob(String(message.guild.id), () => handleAiChat(message));
     return;
   }
 
-  // 명령어 처리
   if (!message.content || !message.content.startsWith(prefix)) return;
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  // AI 채널 인증
   if (command === '인증') {
     if (!message.guild) return;
     if (!isAdminMember(message.member)) {
@@ -989,9 +1158,6 @@ client.on('message', async (message) => {
     runBackup(message);
     return;
   }
-
-    // 사용:
-
 
   // !복귀: 마지막 !해산으로 이동된 인원들을 대기실로 이동
   if (command === '복귀') {
@@ -1040,12 +1206,6 @@ client.on('message', async (message) => {
       return;
     }
 
-    if (!isTeamCommandTextChannel(message)) {
-      try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
-      return;
-    }
-
-
     const n = parseInt(args[0], 10);
     if (isNaN(n) || n < 1) {
       return message.reply('올바른 인원 수를 입력해주세요.');
@@ -1068,19 +1228,47 @@ client.on('message', async (message) => {
       return message.reply('음성 채널에 인원이 부족합니다.');
     }
 
-    const shuffledMembers = shuffleArray(members);
+    // 이전 팀 정보 복사(이전 run과 비교용)
+    const prevTeamsForCompare = (latestTeams && Array.isArray(latestTeams) && latestTeams.length > 0)
+      ? latestTeams
+      : null;
 
-    // teamsMembers: GuildMember[][] (표시용), latestTeams: string[][] (ID 저장용)
-    const teamsMembers = [];
-    let restMembers = shuffledMembers.length;
+    // 새 팀 구성 시 "이전 팀과의 유사도"를 줄이기 위한 시도
+    const MAX_RETRY = 12;
+    const MAX_SIMILAR_RATIO = 0.4; // 최대 40% 정도만 이전 팀과 비슷하도록 허용
 
-    while (restMembers > 0) {
-      const teamSize = Math.min(restMembers, n);
-      const startIndex = teamsMembers.length * n;
-      const teamMembers = shuffledMembers.slice(startIndex, startIndex + teamSize);
-      teamsMembers.push(teamMembers);
-      restMembers -= teamSize;
+    let bestTeamsMembers = null;
+    let bestRatio = 1.0;
+
+    if (!prevTeamsForCompare) {
+      // 이전 팀이 없으면 그냥 한 번 셔플
+      const shuffledMembers = shuffleArray(members);
+      bestTeamsMembers = buildTeamsFromMembersArray(shuffledMembers, n);
+      bestRatio = 0.0;
+    } else {
+      for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
+        const shuffledMembers = shuffleArray(members);
+        const candidateTeams = buildTeamsFromMembersArray(shuffledMembers, n);
+        const diff = evaluateTeamDifference(prevTeamsForCompare, candidateTeams);
+
+        if (diff.ratio < bestRatio) {
+          bestRatio = diff.ratio;
+          bestTeamsMembers = candidateTeams;
+        }
+
+        if (diff.ratio <= MAX_SIMILAR_RATIO) {
+          break;
+        }
+      }
+
+      if (!bestTeamsMembers) {
+        const shuffledMembers = shuffleArray(members);
+        bestTeamsMembers = buildTeamsFromMembersArray(shuffledMembers, n);
+        bestRatio = 1.0;
+      }
     }
+
+    const teamsMembers = bestTeamsMembers;
 
     latestTeams = teamsMembers.map(team => team.map(m => String(m.id)));
     latestTeamsMeta = {
@@ -1104,12 +1292,10 @@ client.on('message', async (message) => {
       teamMessage += '```\n';
     }
 
-    // 랜덤 메시지는 팀표 아래에
     teamMessage += '\n' + randomMessage + '\n';
 
     await sendLongText(message.channel, teamMessage);
 
-    // 참가자 태그는 "마지막"에 별도 메시지로 보낸다(멘션이 잘리지 않게 배치 전송).
     const mentions = members.map(m => '<@' + String(m.id) + '>').join(' ');
     if (mentions) {
       const tokens = mentions.split(' ').filter(Boolean);
@@ -1129,25 +1315,18 @@ client.on('message', async (message) => {
     return;
   }
 
-  // !나눠: 지정 텍스트 채널에서 팀 결과 기준으로 일반방을 자동 생성 + 이동
-  // 제한:
-  // - 다른 봇(PartyBeast)의 "클릭"을 강제로 수행할 수는 없어서, 이 봇이 직접 음성 채널을 생성한다.
-  // - PARTY_CREATE_CHANNEL_ID가 카테고리 아래에 있다면, 그 카테고리에 방을 만든다.
   if (command === '나눠') {
-    // 관리자만 가능
     if (!message.guild) return;
     if (!isAdminMember(message.member)) {
       try { await message.reply('권한이 없다.'); } catch (e) {}
       return;
     }
 
-    // 지정된 텍스트 채널에서만 가능
     if (!isTeamCommandTextChannel(message)) {
       try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
       return;
     }
 
-    // 최근 팀 정보 확인
     if (!latestTeams || latestTeams.length === 0 || !latestTeamsMeta) {
       try { await message.reply('먼저 !팀 명령어로 팀을 구성해라.'); } catch (e) {}
       return;
@@ -1158,7 +1337,6 @@ client.on('message', async (message) => {
       return;
     }
 
-    // PartyBeast '파티생성' 허브 음성채널
     const partyCreate = message.guild.channels.cache.get(String(PARTY_CREATE_CHANNEL_ID));
     if (!partyCreate || partyCreate.type !== 'voice') {
       try { await message.reply('나눠 실패: 파티생성 음성채널을 못 찾음.'); } catch (e) {}
@@ -1175,7 +1353,6 @@ client.on('message', async (message) => {
     const prefixText = cfg && cfg.prefix ? String(cfg.prefix) : '';
     const waitTimeoutMs = 15000;
 
-    // 채널 생성 감지용: 현재 카테고리 내 음성채널 ID 스냅샷
     function snapshotVoiceIds() {
       const ids = new Set();
       const arr = message.guild.channels.cache
@@ -1203,8 +1380,6 @@ client.on('message', async (message) => {
       return null;
     }
 
-    // 실제 동작: "클릭"은 불가. 대신 팀 대표 1명을 partyCreate로 이동시켜 '입장' 이벤트로 PartyBeast가 방을 만들게 한다.
-    // 각 팀별로 순차 처리하여 파티비스트/레이트리밋 충돌을 피한다.
     const createdRoomIds = [];
     lastDisbandedMemberIds.clear();
 
@@ -1213,20 +1388,17 @@ client.on('message', async (message) => {
         const team = latestTeams[t] || [];
         if (!team || team.length === 0) continue;
 
-        // 대표(리더) 선택: 음성 접속중인 멤버 우선
         let leader = null;
         for (let i = 0; i < team.length; i++) {
           const mem = message.guild.members.cache.get(String(team[i]));
           if (mem && mem.voice && mem.voice.channel) { leader = mem; break; }
         }
         if (!leader) {
-          // 접속중인 멤버가 없으면 이 팀은 스킵
           continue;
         }
 
         const beforeIds = snapshotVoiceIds();
 
-        // 리더를 partyCreate로 이동 -> PartyBeast가 새 방 생성
         try {
           await leader.voice.setChannel(partyCreate);
         } catch (e) {
@@ -1234,7 +1406,6 @@ client.on('message', async (message) => {
           continue;
         }
 
-        // 방 생성 대기
         const newRoom = await waitForNewRoom(beforeIds);
         if (!newRoom) {
           try { await message.reply('나눠 실패: 방 생성 감지 실패(타임아웃).'); } catch (e) {}
@@ -1243,7 +1414,6 @@ client.on('message', async (message) => {
 
         createdRoomIds.push(String(newRoom.id));
 
-        // 팀원 전체를 새 방으로 이동(리더 포함)
         for (let i = 0; i < team.length; i++) {
           const mem = message.guild.members.cache.get(String(team[i]));
           if (!mem) continue;
@@ -1257,7 +1427,6 @@ client.on('message', async (message) => {
           }
         }
 
-        // 다음 팀 생성 전 대기(파티비스트 안정화)
         await delay(1200);
       }
 
@@ -1274,7 +1443,8 @@ client.on('message', async (message) => {
 
     return;
   }
-if (command === '해산') {
+
+  if (command === '해산') {
     if (!isAdminMember(message.member)) {
       try { await message.reply('권한이 없다.'); } catch (e) {}
       return;
@@ -1285,12 +1455,10 @@ if (command === '해산') {
       return;
     }
 
-
     if (latestTeams.length === 0) {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
     }
 
-    // 순서대로 내전1부터 10까지 임
     const voiceChannelIds = [
       '1450857003521015921', '1450857559715217560', '1450857466312261786',
       '1450857664388005980', '1450857791789989971', '1450857978289983568',
@@ -1298,7 +1466,6 @@ if (command === '해산') {
       '1451547521531773029'
     ];
 
-    // 이번 해산 대상 저장 초기화
     lastDisbandedMemberIds.clear();
 
     latestTeams.forEach((team, i) => {
@@ -1320,6 +1487,31 @@ if (command === '해산') {
     });
 
     message.channel.send('모든 인원을 이동 시켰습니다!!! @here');
+    return;
+  }
+
+  if (command === '전부이동') {
+    if (!message.guild) return;
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    const voiceChannel = message.member.voice.channel;
+    if (!voiceChannel || voiceChannel.type !== 'voice') {
+      try { await message.reply('전부이동 실패: 먼저 음성 채널에 들어가 주세요.'); } catch (e) {}
+      return;
+    }
+
+    moveAllStateByUser.set(String(message.author.id), {
+      guildId: String(message.guild.id),
+      sourceChannelId: String(voiceChannel.id),
+      createdAtMs: nowMs(),
+    });
+
+    try {
+      await message.reply('어디로 이동할까요? 이동할 음성 채널 이름(또는 채널 멘션, 채널 ID)을 한 번 더 입력해 주세요. (60초 이내)');
+    } catch (e) {}
     return;
   }
 
@@ -1402,7 +1594,6 @@ if (command === '해산') {
   }
 });
 
-// 메시지 수정 시: (캐시에 row가 있는 경우만) 외출목록 A~C 갱신
 client.on('messageUpdate', async (oldMessage, newMessage) => {
   try {
     if (!newMessage) return;
