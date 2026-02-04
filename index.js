@@ -43,12 +43,9 @@ const BACKUP_MAX_MESSAGES = 20000;
 const WAITING_ROOM_VOICE_ID = '1453266042439860224';
 const lastDisbandedMemberIds = new Set(); // !해산으로 이동된 사람 id 저장
 
-// ---- 팀/해산/나눠 명령 채널/파티생성 기준 ----
-// !나눠는 아래 텍스트 채널에서만 동작하도록 제한한다.
-const TEAM_COMMAND_TEXT_CHANNEL_ID = '1442821423495254037';
-// 파티비스트의 "파티 생성" 채널(또는 그와 동일 카테고리) 기준으로 방을 만든다.
-// 이 채널이 카테고리 아래에 있다면, 해당 카테고리에 방을 생성한다.
-const PARTY_CREATE_CHANNEL_ID = '1453251022746030273';
+// ---- 팀/해산 명령 채널 기준 ----
+// !팀, !해산 은 아래 텍스트 채널에서만 동작하도록 제한한다.
+const TEAM_COMMAND_TEXT_CHANNEL_ID = '1450859016665432134';
 
 // ---- PartyBeast Room Renumber Settings ----
 const REN_NUMBER_DELAY_MS = 2000;      // 파티비스트 생성/삭제 이후 기다리는 시간
@@ -1206,6 +1203,12 @@ client.on('message', async (message) => {
       return;
     }
 
+    // 팀짜기 명령은 지정된 텍스트 채널에서만 허용
+    if (!isTeamCommandTextChannel(message)) {
+      try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
+      return;
+    }
+
     const n = parseInt(args[0], 10);
     if (isNaN(n) || n < 1) {
       return message.reply('올바른 인원 수를 입력해주세요.');
@@ -1315,141 +1318,13 @@ client.on('message', async (message) => {
     return;
   }
 
-  if (command === '나눠') {
-    if (!message.guild) return;
-    if (!isAdminMember(message.member)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
-      return;
-    }
-
-    if (!isTeamCommandTextChannel(message)) {
-      try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
-      return;
-    }
-
-    if (!latestTeams || latestTeams.length === 0 || !latestTeamsMeta) {
-      try { await message.reply('먼저 !팀 명령어로 팀을 구성해라.'); } catch (e) {}
-      return;
-    }
-
-    if (String(latestTeamsMeta.textChannelId || '') !== String(message.channel.id)) {
-      try { await message.reply('팀을 만든 채널과 다른 채널에서는 사용할 수 없다.'); } catch (e) {}
-      return;
-    }
-
-    const partyCreate = message.guild.channels.cache.get(String(PARTY_CREATE_CHANNEL_ID));
-    if (!partyCreate || partyCreate.type !== 'voice') {
-      try { await message.reply('나눠 실패: 파티생성 음성채널을 못 찾음.'); } catch (e) {}
-      return;
-    }
-
-    const categoryId = partyCreate.parentID ? String(partyCreate.parentID) : '';
-    if (!categoryId) {
-      try { await message.reply('나눠 실패: 파티생성 채널의 카테고리를 못 찾음.'); } catch (e) {}
-      return;
-    }
-
-    const cfg = managedCategoryMap.get(String(categoryId));
-    const prefixText = cfg && cfg.prefix ? String(cfg.prefix) : '';
-    const waitTimeoutMs = 15000;
-
-    function snapshotVoiceIds() {
-      const ids = new Set();
-      const arr = message.guild.channels.cache
-        .filter((ch) => ch && ch.type === 'voice' && String(ch.parentID) === String(categoryId))
-        .array();
-      for (let i = 0; i < arr.length; i++) ids.add(String(arr[i].id));
-      return ids;
-    }
-
-    async function waitForNewRoom(knownIds) {
-      const started = new Date().getTime();
-      while (new Date().getTime() - started < waitTimeoutMs) {
-        const room = message.guild.channels.cache.find((ch) => {
-          if (!ch || ch.type !== 'voice') return false;
-          if (String(ch.parentID) !== String(categoryId)) return false;
-          if (knownIds.has(String(ch.id))) return false;
-          if (prefixText) {
-            if (String(ch.name || '').indexOf(prefixText) !== 0) return false;
-          }
-          return true;
-        });
-        if (room) return room;
-        await delay(300);
-      }
-      return null;
-    }
-
-    const createdRoomIds = [];
-    lastDisbandedMemberIds.clear();
-
-    try {
-      for (let t = 0; t < latestTeams.length; t++) {
-        const team = latestTeams[t] || [];
-        if (!team || team.length === 0) continue;
-
-        let leader = null;
-        for (let i = 0; i < team.length; i++) {
-          const mem = message.guild.members.cache.get(String(team[i]));
-          if (mem && mem.voice && mem.voice.channel) { leader = mem; break; }
-        }
-        if (!leader) {
-          continue;
-        }
-
-        const beforeIds = snapshotVoiceIds();
-
-        try {
-          await leader.voice.setChannel(partyCreate);
-        } catch (e) {
-          console.error('[Split] leader move failed:', leader.id, e && e.message ? e.message : e);
-          continue;
-        }
-
-        const newRoom = await waitForNewRoom(beforeIds);
-        if (!newRoom) {
-          try { await message.reply('나눠 실패: 방 생성 감지 실패(타임아웃).'); } catch (e) {}
-          return;
-        }
-
-        createdRoomIds.push(String(newRoom.id));
-
-        for (let i = 0; i < team.length; i++) {
-          const mem = message.guild.members.cache.get(String(team[i]));
-          if (!mem) continue;
-          if (!mem.voice || !mem.voice.channel) continue;
-
-          try {
-            await mem.voice.setChannel(newRoom);
-            try { lastDisbandedMemberIds.add(String(mem.id)); } catch (ee) {}
-          } catch (e) {
-            console.error('[Split] move failed:', mem.id, e && e.message ? e.message : e);
-          }
-        }
-
-        await delay(1200);
-      }
-
-      if (createdRoomIds.length === 0) {
-        try { await message.reply('나눠 실패: 생성된 방이 없다. (파티비스트 설정/권한/대상 인원 확인)'); } catch (e) {}
-        return;
-      }
-
-      try { await message.channel.send('나눠 완료: ' + createdRoomIds.length + '개 방 생성 및 이동'); } catch (e) {}
-    } catch (e) {
-      console.error('[Split] error:', e && e.stack ? e.stack : e);
-      try { await message.reply('나눠 실패: 내부 오류. 로그 확인.'); } catch (ee) {}
-    }
-
-    return;
-  }
-
   if (command === '해산') {
     if (!isAdminMember(message.member)) {
       try { await message.reply('권한이 없다.'); } catch (e) {}
       return;
     }
 
+    // 해산 명령도 지정된 텍스트 채널에서만 허용
     if (!isTeamCommandTextChannel(message)) {
       try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
       return;
@@ -1549,46 +1424,11 @@ client.on('message', async (message) => {
     return;
   }
 
-  if (command === '듀오') {
-    const maxMembers = 2;
-
-    if (!message.member.voice.channel) {
-      return message.reply('먼저 음성 채널에 들어가주세요!');
-    }
-
-    const voice = message.member.voice.channel;
-
-    const SPECTATOR_TAG = /\[관전\]/i;
-    const effectiveMembers = voice.members.filter(m => {
-      const name = m.displayName || m.user.username || '';
-      return !m.user.bot && !SPECTATOR_TAG.test(name);
-    });
-
-    const currentMembers = effectiveMembers.size;
-    const remainingMembers = Math.max(maxMembers - currentMembers, 0);
-
-    const invite = await voice.createInvite({ maxAge: 3600 });
-
-    const colors = ['#FF5733', '#C70039', '#900C3F', '#581845', '#2E86C1', '#2ECC71', '#F1C40F', '#8E44AD'];
-    const selectedColor = colors[Math.floor(Math.random() * colors.length)];
-
-    const inviteMessage = new Discord.MessageEmbed()
-      .setTitle(voice.name + '\n듀오 구인 구직 중이에요\n' + remainingMembers + ' 명 더 필요해요')
-      .setColor(selectedColor)
-      .setFooter('해당링크는 1시간 후 자동으로 소멸됩니다.')
-      .setTimestamp();
-
-    message.channel.send(inviteMessage);
-    message.channel.send(invite.url + '\n@here');
-    return;
-  }
-
   if (message.content === '!명령어') {
     message.channel.send(
       '**구인구직 사용방법!**\n음성채널 생성 후 `!놀자` 입력하면 자동으로 초대링크 생성\n\n' +
-      '**듀오 구인구직 사용방법!**\n음성채널 생성 후 `!듀오` 입력하면 듀오(2인) 초대링크 생성\n\n' +
       '**복귀 사용방법!**\n`!복귀` 입력하면 마지막 `!해산`으로 이동된 인원을 대기실로 이동\n\n' +
-      '**팀 짜기 사용방법!**\n내전 대기실 입장 후 `!팀 N` (EX !팀 2 > 듀오씩) 입력 시 음성채널에 있는 인원을 N명만큼 팀 나눠집니다.\n[관전 적용된 인원은미포함]\n해당 봇 저작권은 도비에게 있습니다.'
+      '**팀 짜기 사용방법!**\n지정된 텍스트 채널에서 내전 대기실 입장 후 `!팀 N` (예: !팀 2 > 2인 팀) 입력 시, 현재 음성채널 인원을 N명씩 팀으로 나눕니다.\n[관전 표시된 인원은 팀 구성에서 제외됩니다]\n해당 봇 저작권은 도비에게 있습니다.'
     );
     return;
   }
