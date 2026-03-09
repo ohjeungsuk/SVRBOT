@@ -1,18 +1,13 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger + GPT API via OpenAI Responses + !복귀 + PartyBeast room renumber )
+// index.js (discord.js v12.5.3 + Google Sheets logger + !복귀 + PartyBeast room renumber )
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
-// - OPENAI_API_KEY
 // Optional:
-// - OPENAI_MODEL (default: gpt-4o-mini)
-// - OPENAI_MAX_TOKENS (default: 160)
-// - OPENAI_TIMEOUT_MS (default: 25000)
 //
 // Recommended Heroku dynos: worker=1, web=0
 
 const Discord = require('discord.js');
 const { google } = require('googleapis');
-const https = require('https');
 const client = new Discord.Client({
   partials: ['MESSAGE', 'CHANNEL', 'REACTION'],
 });
@@ -20,18 +15,6 @@ const client = new Discord.Client({
 const prefix = '!';
 let latestTeams = []; // [[memberId...], ...]
 let latestTeamsMeta = { guildId: '', textChannelId: '', voiceChannelId: '', createdAtMs: 0 };
-
-// ---- OpenAI Settings ----
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || '160', 10);
-const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '25000', 10);
-
-// ---- AI Channel 인증 (길드별 1개 채널) ----
-const aiChannelByGuild = new Map(); // guildId -> channelId
-const aiQueueByGuild = new Map();   // guildId -> Promise
-const aiHistoryByChannel = new Map(); // key: guildId:channelId -> [{role, text}]
-const aiCooldownByUser = new Map(); // userId -> lastTimestamp(ms)
 
 // ---- Google Sheets Settings ----
 const TARGET_CHANNEL_ID = '1439239707320909895';
@@ -52,7 +35,6 @@ const REN_NUMBER_DELAY_MS = 2000;      // 파티비스트 생성/삭제 이후 �
 const REN_RENAME_GAP_MS = 700;         // rename 연속 호출 간 간격(레이트리밋 완화)
 
 const MANAGED_ROOM_CATEGORIES = [
-  { categoryId: '1456630426247499918', prefix: '듀오방' },
   { categoryId: '1453251021282476084', prefix: '일반방' },
   { categoryId: '1453251462586171446', prefix: '경쟁방' },
   { categoryId: '1453257882438205531', prefix: '빡겜방' },
@@ -79,16 +61,6 @@ function isAdminMember(member) {
 function isTeamCommandTextChannel(message) {
   if (!message || !message.channel) return false;
   return String(message.channel.id) === String(TEAM_COMMAND_TEXT_CHANNEL_ID);
-}
-
-function getUserNicknameOnly(message) {
-  // 서버 닉네임이 "닉네임/년생/배그닉" 형태일 때, 닉네임만 추출
-  if (!message) return 'User';
-  const display = (message.member && message.member.displayName) ? String(message.member.displayName) : (message.author ? String(message.author.username) : '');
-  if (!display) return 'User';
-  const first = String(display).split('/')[0];
-  const nick = String(first || '').trim();
-  return nick ? nick : String(display).trim();
 }
 
 // 팀 셔플용: Fisher–Yates 셔플
@@ -212,14 +184,6 @@ function enqueueSheetJob(fn) {
   return sheetQueue;
 }
 
-function enqueueAiJob(guildId, fn) {
-  const prev = aiQueueByGuild.get(guildId) || Promise.resolve();
-  const next = prev.then(fn).catch((err) => {
-    console.error('[AIJobError]', err && err.stack ? err.stack : err);
-  });
-  aiQueueByGuild.set(guildId, next);
-  return next;
-}
 
 function getEnv(name) {
   const v = process.env[name];
@@ -601,248 +565,6 @@ async function runBackup(invokingMessage) {
   }
 }
 
-// ---- OpenAI (Responses API) ----
-function extractResponseText(respJson) {
-  if (!respJson) return '';
-  if (respJson.output && Array.isArray(respJson.output)) {
-    let out = '';
-    for (let i = 0; i < respJson.output.length; i++) {
-      const item = respJson.output[i];
-      if (!item || item.type !== 'message' || item.role !== 'assistant') continue;
-      const content = item.content;
-      if (!content || !Array.isArray(content)) continue;
-
-      for (let j = 0; j < content.length; j++) {
-        const c = content[j];
-        if (!c) continue;
-        if (c.type === 'output_text' && typeof c.text === 'string') out += c.text;
-      }
-    }
-    return String(out || '').trim();
-  }
-  return '';
-}
-
-function callOpenAIResponses(instructions, inputText) {
-  return new Promise((resolve) => {
-    if (!OPENAI_API_KEY) {
-      resolve({ ok: false, errorType: 'missing_key', text: '' });
-      return;
-    }
-
-    const bodyObj = {
-      model: OPENAI_MODEL,
-      instructions: instructions,
-      input: inputText,
-      max_output_tokens: isNaN(OPENAI_MAX_TOKENS) ? 160 : OPENAI_MAX_TOKENS,
-      temperature: 0.8,
-      store: false,
-      text: { format: { type: 'text' } },
-    };
-
-    const body = JSON.stringify(bodyObj);
-
-    const req = https.request(
-      {
-        hostname: 'api.openai.com',
-        path: '/v1/responses',
-        method: 'POST',
-        headers: {
-          'Authorization': 'Bearer ' + OPENAI_API_KEY,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-        timeout: OPENAI_TIMEOUT_MS,
-      },
-      (res) => {
-        let data = '';
-        res.on('data', (chunk) => { data += chunk; });
-        res.on('end', () => {
-          let json = null;
-          try { json = JSON.parse(data); } catch (e) { json = null; }
-
-          if (!res || res.statusCode < 200 || res.statusCode >= 300) {
-            const code = json && json.error && json.error.code ? String(json.error.code) : '';
-            const msg = json && json.error && json.error.message ? String(json.error.message) : ('HTTP ' + res.statusCode);
-            const status = res ? res.statusCode : 0;
-
-            if (status === 429 || code === 'rate_limit_exceeded' || code === 'insufficient_quota') {
-              resolve({ ok: false, errorType: 'limit', text: '', raw: msg });
-              return;
-            }
-            resolve({ ok: false, errorType: 'http', text: '', raw: msg });
-            return;
-          }
-
-          const text = extractResponseText(json);
-          resolve({ ok: true, text: text, raw: json });
-        });
-      }
-    );
-
-    req.on('timeout', () => {
-      try { req.destroy(new Error('timeout')); } catch (e) {}
-      resolve({ ok: false, errorType: 'timeout', text: '' });
-    });
-
-    req.on('error', (err) => {
-      resolve({ ok: false, errorType: 'network', text: '', raw: err ? err.message : '' });
-    });
-
-    req.write(body);
-    req.end();
-  });
-}
-
-function getAiChannelId(message) {
-  if (!message || !message.guild) return '';
-  return aiChannelByGuild.get(String(message.guild.id)) || '';
-}
-
-function isAiChannelOrThread(message) {
-  if (!message || !message.guild || !message.channel) return false;
-
-  const aiCid = getAiChannelId(message);
-  if (!aiCid) return false;
-
-  if (String(message.channel.id) === String(aiCid)) return true;
-  if (message.channel.parentID && String(message.channel.parentID) === String(aiCid)) return true;
-  return false;
-}
-
-function getChannelHistoryKey(message) {
-  if (!message || !message.guild || !message.channel) return '';
-  const aiCid = getAiChannelId(message);
-  if (!aiCid) return '';
-  return String(message.guild.id) + ':' + String(aiCid);
-}
-
-function getHistoryFor(message) {
-  const key = getChannelHistoryKey(message);
-  if (!key) return [];
-  const h = aiHistoryByChannel.get(key);
-  if (h && Array.isArray(h)) return h;
-  return [];
-}
-
-function setHistoryFor(message, history) {
-  const key = getChannelHistoryKey(message);
-  if (!key) return;
-  aiHistoryByChannel.set(key, history);
-}
-
-function trimHistory(history) {
-  if (!history || !Array.isArray(history)) return [];
-
-  const maxItems = 12;
-  let h = history.slice(-maxItems);
-
-  let total = 0;
-  for (let i = h.length - 1; i >= 0; i--) {
-    total += String(h[i].text || '').length;
-    if (total > 2500) {
-      h = h.slice(i + 1);
-      break;
-    }
-  }
-  return h;
-}
-
-async function sendLongText(channel, text) {
-  if (!channel) return;
-  const s = String(text || '').trim();
-  if (!s) {
-    await channel.send('현재 작동이 불가능 합니다');
-    return;
-  }
-
-  const LIMIT = 1900;
-  if (s.length <= LIMIT) {
-    await channel.send(s);
-    return;
-  }
-
-  let idx = 0;
-  while (idx < s.length) {
-    const chunk = s.slice(idx, idx + LIMIT);
-    idx += LIMIT;
-    await channel.send(chunk);
-  }
-}
-
-function nowMs() {
-  return new Date().getTime();
-}
-
-function isOnCooldown(userId) {
-  const last = aiCooldownByUser.get(String(userId)) || 0;
-  const t = nowMs();
-  if (t - last < 2000) return true;
-  aiCooldownByUser.set(String(userId), t);
-  return false;
-}
-
-async function handleAiChat(message) {
-  if (!message || !message.guild) return;
-  if (!isAiChannelOrThread(message)) return;
-  if (!message.content) return;
-
-  if (message.content.startsWith(prefix)) return;
-  if (parseLeaveForm(message.content)) return;
-  if (isOnCooldown(message.author.id)) return;
-
-  const raw = String(message.content).trim();
-  if (!raw) return;
-
-  const userNick = getUserNicknameOnly(message);
-
-  const history = trimHistory(getHistoryFor(message));
-
-  const instructionText =
-    '너는 디스코드 채팅용 간단한 대화 봇이다. ' +
-    '대답은 짧고 자연스럽게 한다. ' +
-    '이름은 리터 라고 한다. ' +
-    '나이는 20살이다 ' +
-    '과한 설명은 하지 않는다. ' +
-    '모르는 내용은 모른다고 말한다.';
-
-  let prompt = '';
-  for (let i = 0; i < history.length; i++) {
-    const it = history[i];
-    if (!it || !it.role) continue;
-
-    if (it.role === 'user') {
-      const nm = it.name ? String(it.name) : '';
-      const head = nm ? ('User(' + nm + '): ') : 'User: ';
-      prompt += head + String(it.text || '') + '\n';
-    } else {
-      prompt += 'Assistant: ' + String(it.text || '') + '\n';
-    }
-  }
-  prompt += 'User(' + userNick + '): ' + raw + '\nAssistant:';
-
-  history.push({ role: 'user', name: userNick, text: raw });
-  setHistoryFor(message, trimHistory(history));
-
-  const result = await callOpenAIResponses(instructionText, prompt);
-
-  if (!result.ok) {
-    await message.channel.send('현재 작동이 불가능 합니다');
-    return;
-  }
-
-  let out = String(result.text || '').trim();
-  if (!out) out = '현재 작동이 불가능 합니다';
-
-  const h2 = getHistoryFor(message);
-  h2.push({ role: 'assistant', text: out });
-  setHistoryFor(message, trimHistory(h2));
-
-  await sendLongText(message.channel, out);
-}
-
-
-
 // ---- PartyBeast Room Renumber Implementation ----
 const renumberTimers = new Map();      // key: guildId:categoryId -> timeout
 const renumberQueues = new Map();      // key: guildId:categoryId -> Promise
@@ -996,8 +718,6 @@ client.on('ready', async () => {
   console.log('[Bot] TARGET_CHANNEL_ID:', TARGET_CHANNEL_ID);
   console.log('[Env] DISCORD_TOKEN:', process.env.DISCORD_TOKEN ? 'SET' : 'MISSING');
   console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
-  console.log('[Env] OPENAI_API_KEY:', OPENAI_API_KEY ? 'SET' : 'MISSING');
-  console.log('[Env] OPENAI_MODEL:', OPENAI_MODEL);
 
   try {
     await initSheets();
@@ -1128,27 +848,12 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
-  if (message.guild && isAiChannelOrThread(message) && (!message.content || !message.content.startsWith(prefix))) {
-    enqueueAiJob(String(message.guild.id), () => handleAiChat(message));
-    return;
-  }
 
   if (!message.content || !message.content.startsWith(prefix)) return;
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  if (command === '인증') {
-    if (!message.guild) return;
-    if (!isAdminMember(message.member)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
-      return;
-    }
-    aiChannelByGuild.set(String(message.guild.id), String(message.channel.id));
-    aiHistoryByChannel.set(String(message.guild.id) + ':' + String(message.channel.id), []);
-    try { await message.reply('이 채널이 AI 대화 채널로 설정됐다.'); } catch (e) {}
-    return;
-  }
 
   if (command === '백업') {
     console.log('[Backup] command received by', message.author.tag);
