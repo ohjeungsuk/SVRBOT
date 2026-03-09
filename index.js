@@ -30,6 +30,22 @@ const lastDisbandedMemberIds = new Set(); // !해산으로 이동된 사람 id �
 // !팀, !해산 은 아래 텍스트 채널에서만 동작하도록 제한한다.
 const TEAM_COMMAND_TEXT_CHANNEL_ID = '1450859016665432134';
 
+// ---- Activity Filter Settings ----
+const FILTER_CHAT_CHANNEL_IDS = [
+  '1439240703887671357',
+];
+const FILTER_RECRUIT_CHANNEL_IDS = [
+  '1456630730435068138',
+];
+const FILTER_VOICE_CATEGORY_IDS = [
+  '1453251021282476084',
+];
+const FILTER_VOICE_MINUTES_REQUIRED = 10;
+const FILTER_DEFAULT_PERIOD_DAYS = 14;
+const FILTER_CONFIG_SHEET_TITLE = '활동필터설정';
+const FILTER_STATE_SHEET_TITLE = '활동필터상태';
+const FILTER_LOG_SHEET_TITLE = '활동필터로그';
+
 // ---- PartyBeast Room Renumber Settings ----
 const REN_NUMBER_DELAY_MS = 2000;      // 파티비스트 생성/삭제 이후 기다리는 시간
 const REN_RENAME_GAP_MS = 700;         // rename 연속 호출 간 간격(레이트리밋 완화)
@@ -48,6 +64,36 @@ for (let i = 0; i < MANAGED_ROOM_CATEGORIES.length; i++) {
 // ---- 전부이동 상태 관리 ----
 const moveAllStateByUser = new Map(); // userId -> { guildId, sourceChannelId, createdAtMs }
 const MOVEALL_TIMEOUT_MS = 60000;     // 60초 안에 목적 채널 이름을 받아야 유효
+
+const filterTrackedChatChannelIds = new Set(FILTER_CHAT_CHANNEL_IDS.map((v) => String(v)));
+const filterTrackedRecruitChannelIds = new Set(FILTER_RECRUIT_CHANNEL_IDS.map((v) => String(v)));
+const filterTrackedVoiceCategoryIds = new Set(FILTER_VOICE_CATEGORY_IDS.map((v) => String(v)));
+
+let filterSheetsReady = false;
+let filterDataReady = false;
+let filterConfig = {
+  periodDays: FILTER_DEFAULT_PERIOD_DAYS,
+  testTargetIds: [],
+};
+const filterStateByUserId = new Map();
+
+const FILTER_STATE_COLUMNS = [
+  'userId',
+  'username',
+  'displayName',
+  'isTestTarget',
+  'trackingStartAtKST',
+  'lastChatAtKST',
+  'lastRecruitAtKST',
+  'voiceMinutes',
+  'passReason',
+  'passedAtKST',
+  'lastVoiceJoinAtKST',
+  'lastVoiceChannelId',
+  'kicked',
+  'kickedAtKST',
+  'updatedAtKST',
+];
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -196,6 +242,616 @@ function safeShort(str, maxLen) {
   const s = String(str);
   if (s.length <= maxLen) return s;
   return s.slice(0, maxLen) + '...';
+}
+
+function normalizeDaysInput(value) {
+  const n = parseInt(value, 10);
+  if (isNaN(n) || n < 1) return null;
+  if (n > 365) return 365;
+  return n;
+}
+
+function isFilterTrackedTextChannel(message, channelIdSet) {
+  if (!message || !message.channel) return false;
+
+  const cid = String(message.channel.id);
+  if (channelIdSet.has(cid)) return true;
+
+  if (message.channel.parentID && channelIdSet.has(String(message.channel.parentID))) {
+    return true;
+  }
+
+  return false;
+}
+
+function isTrackedVoiceChannel(channel) {
+  if (!channel) return false;
+  if (channel.type !== 'voice') return false;
+  if (!channel.parentID) return false;
+  if (!filterTrackedVoiceCategoryIds.has(String(channel.parentID))) return false;
+  if (String(channel.name || '').indexOf('[관전]') >= 0) return false;
+  return true;
+}
+
+function parseKSTStringToDate(kstText) {
+  if (!kstText) return null;
+  const m = String(kstText).match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+  if (!m) return null;
+
+  const year = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  const day = parseInt(m[3], 10);
+  const hour = parseInt(m[4], 10);
+  const minute = parseInt(m[5], 10);
+  const second = parseInt(m[6], 10);
+
+  return new Date(Date.UTC(year, month - 1, day, hour - 9, minute, second));
+}
+
+function diffMinutesFloor(fromDate, toDate) {
+  if (!fromDate || !toDate) return 0;
+  const ms = toDate.getTime() - fromDate.getTime();
+  if (ms <= 0) return 0;
+  return Math.floor(ms / 60000);
+}
+
+function filterStateToRow(state) {
+  return [
+    state.userId || '',
+    state.username || '',
+    state.displayName || '',
+    state.isTestTarget || 'N',
+    state.trackingStartAtKST || '',
+    state.lastChatAtKST || '',
+    state.lastRecruitAtKST || '',
+    String(state.voiceMinutes || '0'),
+    state.passReason || '',
+    state.passedAtKST || '',
+    state.lastVoiceJoinAtKST || '',
+    state.lastVoiceChannelId || '',
+    state.kicked || 'N',
+    state.kickedAtKST || '',
+    state.updatedAtKST || '',
+  ];
+}
+
+function rowToFilterState(row, rowNumber) {
+  const src = Array.isArray(row) ? row : [];
+  return {
+    rowNumber: rowNumber,
+    userId: src[0] ? String(src[0]) : '',
+    username: src[1] ? String(src[1]) : '',
+    displayName: src[2] ? String(src[2]) : '',
+    isTestTarget: src[3] === 'Y' ? 'Y' : 'N',
+    trackingStartAtKST: src[4] ? String(src[4]) : '',
+    lastChatAtKST: src[5] ? String(src[5]) : '',
+    lastRecruitAtKST: src[6] ? String(src[6]) : '',
+    voiceMinutes: src[7] ? String(src[7]) : '0',
+    passReason: src[8] ? String(src[8]) : '',
+    passedAtKST: src[9] ? String(src[9]) : '',
+    lastVoiceJoinAtKST: src[10] ? String(src[10]) : '',
+    lastVoiceChannelId: src[11] ? String(src[11]) : '',
+    kicked: src[12] === 'Y' ? 'Y' : 'N',
+    kickedAtKST: src[13] ? String(src[13]) : '',
+    updatedAtKST: src[14] ? String(src[14]) : '',
+  };
+}
+
+async function ensureSheetWithHeader(title, header) {
+  await initSheets();
+
+  const existing = await listSheetTitles();
+  if (existing.indexOf(title) < 0) {
+    await createSheetTab(title);
+    await sheetsApi.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: a1Range(title, 'A1:' + String.fromCharCode(64 + header.length) + '1'),
+      valueInputOption: 'RAW',
+      requestBody: { values: [header] },
+    });
+    return;
+  }
+
+  const read = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: a1Range(title, 'A1:' + String.fromCharCode(64 + header.length) + '1'),
+  });
+  const values = read && read.data && read.data.values ? read.data.values : [];
+  const row = values.length > 0 ? values[0] : [];
+  let needWrite = false;
+  for (let i = 0; i < header.length; i++) {
+    if (String(row[i] || '') !== String(header[i])) {
+      needWrite = true;
+      break;
+    }
+  }
+  if (needWrite) {
+    await sheetsApi.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: a1Range(title, 'A1:' + String.fromCharCode(64 + header.length) + '1'),
+      valueInputOption: 'RAW',
+      requestBody: { values: [header] },
+    });
+  }
+}
+
+async function ensureFilterSheetsReady() {
+  if (filterSheetsReady) return;
+
+  await ensureSheetWithHeader(FILTER_CONFIG_SHEET_TITLE, ['key', 'value']);
+  await ensureSheetWithHeader(FILTER_STATE_SHEET_TITLE, [
+    'user_id', 'username', 'display_name', 'is_test_target', 'tracking_start_at_kst',
+    'last_chat_at_kst', 'last_recruit_at_kst', 'voice_minutes', 'pass_reason', 'passed_at_kst',
+    'last_voice_join_at_kst', 'last_voice_channel_id', 'kicked', 'kicked_at_kst', 'updated_at_kst'
+  ]);
+  await ensureSheetWithHeader(FILTER_LOG_SHEET_TITLE, ['time_kst', 'type', 'user_id', 'username', 'display_name', 'detail']);
+
+  filterSheetsReady = true;
+}
+
+async function loadFilterConfigFromSheet() {
+  await ensureFilterSheetsReady();
+
+  const res = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: a1Range(FILTER_CONFIG_SHEET_TITLE, 'A2:B20'),
+  });
+
+  const values = res && res.data && res.data.values ? res.data.values : [];
+  const nextConfig = {
+    periodDays: FILTER_DEFAULT_PERIOD_DAYS,
+    testTargetIds: [],
+  };
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    const key = row[0] ? String(row[0]) : '';
+    const value = row[1] ? String(row[1]) : '';
+
+    if (key === 'period_days') {
+      const n = normalizeDaysInput(value);
+      if (n) nextConfig.periodDays = n;
+    } else if (key === 'test_target_ids') {
+      nextConfig.testTargetIds = value
+        ? value.split(',').map((v) => String(v).trim()).filter((v) => v.length > 0)
+        : [];
+    }
+  }
+
+  filterConfig = nextConfig;
+}
+
+async function saveFilterConfigToSheet() {
+  await ensureFilterSheetsReady();
+
+  const nowKST = formatKSTFromDate(new Date());
+  const values = [
+    ['period_days', String(filterConfig.periodDays || FILTER_DEFAULT_PERIOD_DAYS)],
+    ['test_target_ids', (filterConfig.testTargetIds || []).join(',')],
+    ['updated_at', nowKST],
+  ];
+
+  await sheetsApi.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: a1Range(FILTER_CONFIG_SHEET_TITLE, 'A2:B4'),
+    valueInputOption: 'RAW',
+    requestBody: { values: values },
+  });
+}
+
+async function loadFilterStateFromSheet() {
+  await ensureFilterSheetsReady();
+
+  const res = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: a1Range(FILTER_STATE_SHEET_TITLE, 'A2:O'),
+  });
+
+  const values = res && res.data && res.data.values ? res.data.values : [];
+  filterStateByUserId.clear();
+
+  for (let i = 0; i < values.length; i++) {
+    const rowNumber = i + 2;
+    const state = rowToFilterState(values[i], rowNumber);
+    if (!state.userId) continue;
+    filterStateByUserId.set(String(state.userId), state);
+  }
+}
+
+async function ensureFilterDataLoaded() {
+  if (filterDataReady) return;
+  await loadFilterConfigFromSheet();
+  await loadFilterStateFromSheet();
+  filterDataReady = true;
+}
+
+async function appendFilterLog(type, memberOrState, detail) {
+  await ensureFilterSheetsReady();
+
+  const nowKST = formatKSTFromDate(new Date());
+  let userId = '';
+  let username = '';
+  let displayName = '';
+
+  if (memberOrState) {
+    if (memberOrState.user && memberOrState.id) {
+      userId = String(memberOrState.id || '');
+      username = memberOrState.user && memberOrState.user.username ? String(memberOrState.user.username) : '';
+      displayName = memberOrState.displayName ? String(memberOrState.displayName) : username;
+    } else {
+      userId = memberOrState.userId ? String(memberOrState.userId) : '';
+      username = memberOrState.username ? String(memberOrState.username) : '';
+      displayName = memberOrState.displayName ? String(memberOrState.displayName) : '';
+    }
+  }
+
+  await sheetsApi.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: a1Range(FILTER_LOG_SHEET_TITLE, 'A:F'),
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [[nowKST, String(type || ''), userId, username, displayName, String(detail || '')]] },
+  });
+}
+
+function getFilterState(userId) {
+  return filterStateByUserId.get(String(userId)) || null;
+}
+
+function isCurrentTestTargetId(userId) {
+  return filterConfig.testTargetIds.indexOf(String(userId)) >= 0;
+}
+
+function buildEmptyFilterStateForMember(member, nowDate) {
+  const nowKST = formatKSTFromDate(nowDate || new Date());
+  return {
+    rowNumber: null,
+    userId: String(member.id),
+    username: member.user && member.user.username ? String(member.user.username) : '',
+    displayName: member.displayName ? String(member.displayName) : (member.user && member.user.username ? String(member.user.username) : ''),
+    isTestTarget: 'Y',
+    trackingStartAtKST: nowKST,
+    lastChatAtKST: '',
+    lastRecruitAtKST: '',
+    voiceMinutes: '0',
+    passReason: '',
+    passedAtKST: '',
+    lastVoiceJoinAtKST: '',
+    lastVoiceChannelId: '',
+    kicked: 'N',
+    kickedAtKST: '',
+    updatedAtKST: nowKST,
+  };
+}
+
+async function saveFilterState(state) {
+  await ensureFilterSheetsReady();
+
+  const row = filterStateToRow(state);
+  if (state.rowNumber) {
+    await sheetsApi.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: a1Range(FILTER_STATE_SHEET_TITLE, 'A' + state.rowNumber + ':O' + state.rowNumber),
+      valueInputOption: 'RAW',
+      requestBody: { values: [row] },
+    });
+  } else {
+    const res = await sheetsApi.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: a1Range(FILTER_STATE_SHEET_TITLE, 'A:O'),
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [row] },
+    });
+
+    const updatedRange = res && res.data && res.data.updates ? res.data.updates.updatedRange : null;
+    const rowNum = extractRowNumberFromUpdatedRange(updatedRange);
+    if (rowNum) state.rowNumber = rowNum;
+  }
+
+  filterStateByUserId.set(String(state.userId), state);
+}
+
+async function setFilterPass(state, reason, eventDate, extraDetail) {
+  const nowDate = eventDate || new Date();
+  const nowKST = formatKSTFromDate(nowDate);
+
+  state.passReason = String(reason || '');
+  state.passedAtKST = nowKST;
+  state.updatedAtKST = nowKST;
+  state.lastVoiceJoinAtKST = '';
+  state.lastVoiceChannelId = '';
+
+  await saveFilterState(state);
+  await appendFilterLog('PASS', state, 'reason=' + state.passReason + (extraDetail ? ' ' + extraDetail : ''));
+}
+
+async function updateFilterActivityForMessage(message, activityType) {
+  if (!message || !message.guild || !message.member) return;
+
+  await ensureFilterDataLoaded();
+
+  const userId = String(message.author.id);
+  if (!isCurrentTestTargetId(userId)) return;
+
+  let state = getFilterState(userId);
+  if (!state) {
+    state = buildEmptyFilterStateForMember(message.member, message.createdAt || new Date());
+  }
+
+  if (state.kicked === 'Y' || state.passedAtKST) return;
+
+  const eventKST = formatKSTFromDate(message.createdAt || new Date());
+  state.username = message.author.username ? String(message.author.username) : state.username;
+  state.displayName = message.member.displayName ? String(message.member.displayName) : state.displayName;
+  state.isTestTarget = 'Y';
+  state.updatedAtKST = eventKST;
+
+  if (activityType === 'chat') state.lastChatAtKST = eventKST;
+  if (activityType === 'recruit') state.lastRecruitAtKST = eventKST;
+
+  await saveFilterState(state);
+  await setFilterPass(state, activityType, message.createdAt || new Date(), 'channel=' + String(message.channel.id));
+}
+
+async function finalizeVoiceMinutesForState(state, leaveDate) {
+  if (!state || !state.lastVoiceJoinAtKST) return;
+
+  const joinDate = parseKSTStringToDate(state.lastVoiceJoinAtKST);
+  const endDate = leaveDate || new Date();
+  const minutes = diffMinutesFloor(joinDate, endDate);
+  const current = parseInt(state.voiceMinutes || '0', 10) || 0;
+  const nextMinutes = current + minutes;
+  const nowKST = formatKSTFromDate(endDate);
+
+  state.voiceMinutes = String(nextMinutes);
+  state.lastVoiceJoinAtKST = '';
+  state.lastVoiceChannelId = '';
+  state.updatedAtKST = nowKST;
+
+  await saveFilterState(state);
+  await appendFilterLog('VOICE_ACCUM', state, 'added=' + minutes + ' total=' + nextMinutes);
+
+  if (!state.passedAtKST && nextMinutes >= FILTER_VOICE_MINUTES_REQUIRED) {
+    await setFilterPass(state, 'voice', endDate, 'minutes=' + nextMinutes);
+  }
+}
+
+async function startVoiceTrackingForState(state, channel, startDate) {
+  const nowDate = startDate || new Date();
+  const nowKST = formatKSTFromDate(nowDate);
+
+  state.lastVoiceJoinAtKST = nowKST;
+  state.lastVoiceChannelId = channel ? String(channel.id) : '';
+  state.updatedAtKST = nowKST;
+
+  await saveFilterState(state);
+  await appendFilterLog('VOICE_JOIN', state, 'channel=' + (channel ? String(channel.id) : ''));
+}
+
+async function handleTrackedVoiceTransition(oldState, newState) {
+  const member = newState && newState.member ? newState.member : (oldState ? oldState.member : null);
+  if (!member || !member.user || member.user.bot) return;
+
+  await ensureFilterDataLoaded();
+
+  const userId = String(member.id);
+  if (!isCurrentTestTargetId(userId)) return;
+
+  let state = getFilterState(userId);
+  if (!state) {
+    state = buildEmptyFilterStateForMember(member, new Date());
+  }
+
+  if (state.kicked === 'Y' || state.passedAtKST) return;
+
+  state.username = member.user.username ? String(member.user.username) : state.username;
+  state.displayName = member.displayName ? String(member.displayName) : state.displayName;
+  state.isTestTarget = 'Y';
+
+  const beforeChannel = oldState ? oldState.channel : null;
+  const afterChannel = newState ? newState.channel : null;
+  const beforeTracked = isTrackedVoiceChannel(beforeChannel);
+  const afterTracked = isTrackedVoiceChannel(afterChannel);
+
+  if (beforeTracked && (!afterTracked || String(beforeChannel.id) !== String(afterChannel ? afterChannel.id : ''))) {
+    await finalizeVoiceMinutesForState(state, new Date());
+    if (state.passedAtKST) return;
+  }
+
+  if (afterTracked && (!beforeTracked || String(beforeChannel ? beforeChannel.id : '') !== String(afterChannel.id))) {
+    await startVoiceTrackingForState(state, afterChannel, new Date());
+  }
+}
+
+async function setFilterPeriodDays(days) {
+  filterConfig.periodDays = days;
+  await saveFilterConfigToSheet();
+  await appendFilterLog('PERIOD_SET', null, 'days=' + String(days));
+}
+
+async function setTestTargetsFromMembers(members) {
+  await ensureFilterDataLoaded();
+
+  const uniqueMap = new Map();
+  for (let i = 0; i < members.length; i++) {
+    const member = members[i];
+    if (!member || !member.id || !member.user || member.user.bot) continue;
+    uniqueMap.set(String(member.id), member);
+  }
+
+  const nowDate = new Date();
+  const nowKST = formatKSTFromDate(nowDate);
+  const newIds = Array.from(uniqueMap.keys());
+
+  const oldIds = filterConfig.testTargetIds ? filterConfig.testTargetIds.slice() : [];
+  for (let i = 0; i < oldIds.length; i++) {
+    const oldId = String(oldIds[i]);
+    if (newIds.indexOf(oldId) >= 0) continue;
+
+    const oldState = getFilterState(oldId);
+    if (!oldState) continue;
+    oldState.isTestTarget = 'N';
+    oldState.lastVoiceJoinAtKST = '';
+    oldState.lastVoiceChannelId = '';
+    oldState.updatedAtKST = nowKST;
+    await saveFilterState(oldState);
+  }
+
+  for (let i = 0; i < newIds.length; i++) {
+    const member = uniqueMap.get(newIds[i]);
+    const existingState = getFilterState(newIds[i]);
+    const state = buildEmptyFilterStateForMember(member, nowDate);
+    if (existingState && existingState.rowNumber) state.rowNumber = existingState.rowNumber;
+    await saveFilterState(state);
+    await appendFilterLog('TEST_TARGET_SET', state, 'tracking_start=' + state.trackingStartAtKST);
+
+    if (member.voice && member.voice.channel && isTrackedVoiceChannel(member.voice.channel)) {
+      await startVoiceTrackingForState(state, member.voice.channel, nowDate);
+    }
+  }
+
+  filterConfig.testTargetIds = newIds;
+  await saveFilterConfigToSheet();
+}
+
+function buildFilterStatusLine(state, nowDate) {
+  const now = nowDate || new Date();
+  const started = parseKSTStringToDate(state.trackingStartAtKST);
+  const passed = !!state.passedAtKST;
+  const kicked = state.kicked === 'Y';
+  const voiceMinutes = parseInt(state.voiceMinutes || '0', 10) || 0;
+
+  if (kicked) {
+    return state.displayName + ' - 이미 강퇴됨';
+  }
+
+  if (passed) {
+    return state.displayName + ' - 통과 (' + state.passReason + ')';
+  }
+
+  if (!started) {
+    return state.displayName + ' - 시작시간 없음';
+  }
+
+  const elapsedMs = now.getTime() - started.getTime();
+  const periodMs = (filterConfig.periodDays || FILTER_DEFAULT_PERIOD_DAYS) * 24 * 60 * 60 * 1000;
+
+  if (elapsedMs < periodMs) {
+    const remainMs = periodMs - elapsedMs;
+    const remainHours = Math.ceil(remainMs / 3600000);
+    return state.displayName + ' - 대기중 (남은시간 약 ' + remainHours + '시간, 음성 ' + voiceMinutes + '분)';
+  }
+
+  return state.displayName + ' - 미통과 (채팅/구인구직 없음, 음성 ' + voiceMinutes + '분)';
+}
+
+async function runFilterForTestTargets(message) {
+  await ensureFilterDataLoaded();
+
+  if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
+    await message.reply('테스트 대상자가 없다. 먼저 !테스트 @대상 형식으로 지정해라.');
+    return;
+  }
+
+  const guild = message.guild;
+  const nowDate = new Date();
+  const resultLines = [];
+  const kickTargets = [];
+
+  for (let i = 0; i < filterConfig.testTargetIds.length; i++) {
+    const userId = String(filterConfig.testTargetIds[i]);
+    const state = getFilterState(userId);
+    if (!state) continue;
+
+    resultLines.push(buildFilterStatusLine(state, nowDate));
+
+    if (state.kicked === 'Y' || state.passedAtKST) continue;
+
+    const started = parseKSTStringToDate(state.trackingStartAtKST);
+    if (!started) continue;
+
+    const elapsedMs = nowDate.getTime() - started.getTime();
+    const periodMs = (filterConfig.periodDays || FILTER_DEFAULT_PERIOD_DAYS) * 24 * 60 * 60 * 1000;
+    if (elapsedMs < periodMs) continue;
+
+    kickTargets.push(state);
+  }
+
+  await sendLongText(message.channel, [
+    '**필터 결과**',
+    '기간: ' + String(filterConfig.periodDays) + '일',
+    '대상: ' + String(filterConfig.testTargetIds.length) + '명',
+    '',
+    resultLines.length > 0 ? resultLines.join('\n') : '대상 없음'
+  ].join('\n'));
+
+  for (let i = 0; i < kickTargets.length; i++) {
+    const state = kickTargets[i];
+    let member = guild.members.cache.get(String(state.userId));
+    if (!member) {
+      try { member = await guild.members.fetch(String(state.userId)); } catch (e) { member = null; }
+    }
+
+    if (!member) {
+      await appendFilterLog('KICK_SKIP', state, 'member_not_found');
+      continue;
+    }
+
+    if (!member.kickable) {
+      await appendFilterLog('KICK_SKIP', state, 'member_not_kickable');
+      try { await message.channel.send(state.displayName + ' 강퇴 실패: 봇 권한 또는 역할 순서를 확인해라.'); } catch (e) {}
+      continue;
+    }
+
+    const reason = '필터 기간 내 활동 조건 미충족';
+    try {
+      await member.send('귀하께서는 지정된 테스트 기간 동안 활동 조건을 충족하지 않아 퇴출되었습니다.');
+    } catch (e) {}
+
+    try {
+      await member.kick(reason);
+      const nowKST = formatKSTFromDate(new Date());
+      state.kicked = 'Y';
+      state.kickedAtKST = nowKST;
+      state.updatedAtKST = nowKST;
+      await saveFilterState(state);
+      await appendFilterLog('KICKED', state, 'reason=' + reason);
+      try { await message.channel.send(state.displayName + ' 퇴출 완료'); } catch (e) {}
+    } catch (e) {
+      await appendFilterLog('KICK_FAIL', state, e && e.message ? e.message : 'unknown_error');
+      try { await message.channel.send(state.displayName + ' 강퇴 실패: ' + (e && e.message ? e.message : '알 수 없는 오류')); } catch (ee) {}
+    }
+  }
+}
+
+async function resolveMentionOrIdMembers(message, rawArgs) {
+  const result = [];
+  const seen = new Set();
+  if (message.mentions && message.mentions.members) {
+    message.mentions.members.forEach((member) => {
+      if (!member || !member.id) return;
+      const id = String(member.id);
+      if (seen.has(id)) return;
+      seen.add(id);
+      result.push(member);
+    });
+  }
+
+  for (let i = 0; i < rawArgs.length; i++) {
+    const token = String(rawArgs[i] || '').trim();
+    if (!/^[0-9]{5,}$/.test(token)) continue;
+    if (seen.has(token)) continue;
+    let member = message.guild.members.cache.get(token);
+    if (!member) {
+      try { member = await message.guild.members.fetch(token); } catch (e) { member = null; }
+    }
+    if (!member) continue;
+    seen.add(token);
+    result.push(member);
+  }
+
+  return result;
 }
 
 function parseServiceAccountFromB64() {
@@ -721,6 +1377,7 @@ client.on('ready', async () => {
 
   try {
     await initSheets();
+    await ensureFilterDataLoaded();
   } catch (e) {
     console.error('[SheetsInitFailed]', e && e.stack ? e.stack : e);
   }
@@ -753,6 +1410,10 @@ client.on('channelDelete', (channel) => {
   } catch (e) {
     console.error('[channelDelete handler error]', e && e.stack ? e.stack : e);
   }
+});
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+  enqueueSheetJob(() => handleTrackedVoiceTransition(oldState, newState));
 });
 
 // 메시지 작성 시
@@ -848,6 +1509,15 @@ client.on('message', async (message) => {
     enqueueSheetJob(() => appendLeaveRow(message));
   }
 
+  try {
+    if (isFilterTrackedTextChannel(message, filterTrackedChatChannelIds)) {
+      enqueueSheetJob(() => updateFilterActivityForMessage(message, 'chat'));
+    } else if (isFilterTrackedTextChannel(message, filterTrackedRecruitChannelIds)) {
+      enqueueSheetJob(() => updateFilterActivityForMessage(message, 'recruit'));
+    }
+  } catch (e) {
+    console.error('[FilterMessageTrackError]', e && e.stack ? e.stack : e);
+  }
 
   if (!message.content || !message.content.startsWith(prefix)) return;
 
@@ -858,6 +1528,79 @@ client.on('message', async (message) => {
   if (command === '백업') {
     console.log('[Backup] command received by', message.author.tag);
     runBackup(message);
+    return;
+  }
+
+  if (command === '기간') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    const days = normalizeDaysInput(args[0]);
+    if (!days) {
+      try { await message.reply('사용법: !기간 1'); } catch (e) {}
+      return;
+    }
+
+    await enqueueSheetJob(() => setFilterPeriodDays(days));
+    try { await message.reply('필터 기간을 ' + String(days) + '일로 설정했다.'); } catch (e) {}
+    return;
+  }
+
+  if (command === '테스트') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    const members = await resolveMentionOrIdMembers(message, args);
+    if (!members || members.length === 0) {
+      try { await message.reply('사용법: !테스트 @유저1 @유저2'); } catch (e) {}
+      return;
+    }
+
+    await enqueueSheetJob(() => setTestTargetsFromMembers(members));
+    try { await message.reply('테스트 대상자 설정 완료: ' + members.map((m) => String(m.displayName)).join(', ')); } catch (e) {}
+    return;
+  }
+
+  if (command === '테스트목록') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    await ensureFilterDataLoaded();
+    if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
+      try { await message.reply('현재 테스트 대상자가 없다.'); } catch (e) {}
+      return;
+    }
+
+    const names = [];
+    for (let i = 0; i < filterConfig.testTargetIds.length; i++) {
+      const state = getFilterState(filterConfig.testTargetIds[i]);
+      if (state) names.push(state.displayName + ' (' + state.userId + ')');
+    }
+
+    try {
+      await sendLongText(message.channel, [
+        '**테스트 대상자 목록**',
+        '기간: ' + String(filterConfig.periodDays) + '일',
+        '',
+        names.join('\n')
+      ].join('\n'));
+    } catch (e) {}
+    return;
+  }
+
+  if (command === '필터') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    await enqueueSheetJob(() => runFilterForTestTargets(message));
     return;
   }
 
