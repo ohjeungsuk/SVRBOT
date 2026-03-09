@@ -72,7 +72,8 @@ const filterTrackedVoiceCategoryIds = new Set(FILTER_VOICE_CATEGORY_IDS.map((v) 
 let filterSheetsReady = false;
 let filterDataReady = false;
 let filterConfig = {
-  periodDays: FILTER_DEFAULT_PERIOD_DAYS,
+  periodDays: null,
+  periodSetAtKST: '',
   testTargetIds: [],
 };
 const filterStateByUserId = new Map();
@@ -244,6 +245,28 @@ function safeShort(str, maxLen) {
   return s.slice(0, maxLen) + '...';
 }
 
+async function sendLongText(channel, text) {
+  if (!channel || !text) return;
+
+  const src = String(text);
+  const limit = 1900;
+  if (src.length <= limit) {
+    await channel.send(src);
+    return;
+  }
+
+  let start = 0;
+  while (start < src.length) {
+    let end = Math.min(start + limit, src.length);
+    if (end < src.length) {
+      const cut = src.lastIndexOf('\n', end);
+      if (cut > start + 200) end = cut;
+    }
+    await channel.send(src.slice(start, end));
+    start = end;
+  }
+}
+
 function normalizeDaysInput(value) {
   const n = parseInt(value, 10);
   if (isNaN(n) || n < 1) return null;
@@ -399,7 +422,8 @@ async function loadFilterConfigFromSheet() {
 
   const values = res && res.data && res.data.values ? res.data.values : [];
   const nextConfig = {
-    periodDays: FILTER_DEFAULT_PERIOD_DAYS,
+    periodDays: null,
+    periodSetAtKST: '',
     testTargetIds: [],
   };
 
@@ -411,6 +435,8 @@ async function loadFilterConfigFromSheet() {
     if (key === 'period_days') {
       const n = normalizeDaysInput(value);
       if (n) nextConfig.periodDays = n;
+    } else if (key === 'period_set_at_kst') {
+      nextConfig.periodSetAtKST = value ? String(value) : '';
     } else if (key === 'test_target_ids') {
       nextConfig.testTargetIds = value
         ? value.split(',').map((v) => String(v).trim()).filter((v) => v.length > 0)
@@ -426,14 +452,15 @@ async function saveFilterConfigToSheet() {
 
   const nowKST = formatKSTFromDate(new Date());
   const values = [
-    ['period_days', String(filterConfig.periodDays || FILTER_DEFAULT_PERIOD_DAYS)],
+    ['period_days', filterConfig.periodDays ? String(filterConfig.periodDays) : ''],
+    ['period_set_at_kst', filterConfig.periodSetAtKST || ''],
     ['test_target_ids', (filterConfig.testTargetIds || []).join(',')],
     ['updated_at', nowKST],
   ];
 
   await sheetsApi.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
-    range: a1Range(FILTER_CONFIG_SHEET_TITLE, 'A2:B4'),
+    range: a1Range(FILTER_CONFIG_SHEET_TITLE, 'A2:B5'),
     valueInputOption: 'RAW',
     requestBody: { values: values },
   });
@@ -500,6 +527,10 @@ function getFilterState(userId) {
 
 function isCurrentTestTargetId(userId) {
   return filterConfig.testTargetIds.indexOf(String(userId)) >= 0;
+}
+
+function isFilterPeriodReady() {
+  return !!(filterConfig && filterConfig.periodDays && filterConfig.periodSetAtKST);
 }
 
 function buildEmptyFilterStateForMember(member, nowDate) {
@@ -666,6 +697,7 @@ async function handleTrackedVoiceTransition(oldState, newState) {
 
 async function setFilterPeriodDays(days) {
   filterConfig.periodDays = days;
+  filterConfig.periodSetAtKST = formatKSTFromDate(new Date());
   await saveFilterConfigToSheet();
   await appendFilterLog('PERIOD_SET', null, 'days=' + String(days));
 }
@@ -715,6 +747,27 @@ async function setTestTargetsFromMembers(members) {
   await saveFilterConfigToSheet();
 }
 
+async function clearTestTargets() {
+  await ensureFilterDataLoaded();
+
+  const nowKST = formatKSTFromDate(new Date());
+  const oldIds = filterConfig.testTargetIds ? filterConfig.testTargetIds.slice() : [];
+
+  for (let i = 0; i < oldIds.length; i++) {
+    const state = getFilterState(oldIds[i]);
+    if (!state) continue;
+    state.isTestTarget = 'N';
+    state.lastVoiceJoinAtKST = '';
+    state.lastVoiceChannelId = '';
+    state.updatedAtKST = nowKST;
+    await saveFilterState(state);
+    await appendFilterLog('TEST_TARGET_CLEAR', state, 'cleared');
+  }
+
+  filterConfig.testTargetIds = [];
+  await saveFilterConfigToSheet();
+}
+
 function buildFilterStatusLine(state, nowDate) {
   const now = nowDate || new Date();
   const started = parseKSTStringToDate(state.trackingStartAtKST);
@@ -735,7 +788,7 @@ function buildFilterStatusLine(state, nowDate) {
   }
 
   const elapsedMs = now.getTime() - started.getTime();
-  const periodMs = (filterConfig.periodDays || FILTER_DEFAULT_PERIOD_DAYS) * 24 * 60 * 60 * 1000;
+  const periodMs = (filterConfig.periodDays || 0) * 24 * 60 * 60 * 1000;
 
   if (elapsedMs < periodMs) {
     const remainMs = periodMs - elapsedMs;
@@ -748,6 +801,11 @@ function buildFilterStatusLine(state, nowDate) {
 
 async function runFilterForTestTargets(message) {
   await ensureFilterDataLoaded();
+
+  if (!isFilterPeriodReady()) {
+    await message.reply('먼저 !기간 N 으로 기간부터 설정해라. 예: !기간 1');
+    return;
+  }
 
   if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
     await message.reply('테스트 대상자가 없다. 먼저 !테스트 @대상 형식으로 지정해라.');
@@ -772,7 +830,7 @@ async function runFilterForTestTargets(message) {
     if (!started) continue;
 
     const elapsedMs = nowDate.getTime() - started.getTime();
-    const periodMs = (filterConfig.periodDays || FILTER_DEFAULT_PERIOD_DAYS) * 24 * 60 * 60 * 1000;
+    const periodMs = (filterConfig.periodDays || 0) * 24 * 60 * 60 * 1000;
     if (elapsedMs < periodMs) continue;
 
     kickTargets.push(state);
@@ -1544,13 +1602,19 @@ client.on('message', async (message) => {
     }
 
     await enqueueSheetJob(() => setFilterPeriodDays(days));
-    try { await message.reply('필터 기간을 ' + String(days) + '일로 설정했다.'); } catch (e) {}
+    try { await message.reply('필터 기간을 ' + String(days) + '일로 설정했다. 이제 !테스트 @유저 형식으로 대상자를 지정해라.'); } catch (e) {}
     return;
   }
 
   if (command === '테스트') {
     if (!isAdminMember(message.member)) {
       try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    await ensureFilterDataLoaded();
+    if (!isFilterPeriodReady()) {
+      try { await message.reply('먼저 !기간 N 으로 기간부터 설정해라. 예: !기간 1'); } catch (e) {}
       return;
     }
 
@@ -1565,7 +1629,7 @@ client.on('message', async (message) => {
     return;
   }
 
-  if (command === '테스트목록') {
+  if (command === '테스트삭제') {
     if (!isAdminMember(message.member)) {
       try { await message.reply('권한이 없다.'); } catch (e) {}
       return;
@@ -1573,24 +1637,54 @@ client.on('message', async (message) => {
 
     await ensureFilterDataLoaded();
     if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
-      try { await message.reply('현재 테스트 대상자가 없다.'); } catch (e) {}
+      try { await message.reply('삭제할 테스트 대상자가 없다.'); } catch (e) {}
+      return;
+    }
+
+    await enqueueSheetJob(() => clearTestTargets());
+    try { await message.reply('현재 테스트 대상자 설정을 전부 삭제했다.'); } catch (e) {}
+    return;
+  }
+
+  if (command === '테스트목록') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
+    await ensureFilterDataLoaded();
+
+    const headerLines = [
+      '**테스트 대상자 목록**',
+      '기간 설정: ' + (isFilterPeriodReady() ? (String(filterConfig.periodDays) + '일') : '미설정'),
+      ''
+    ];
+
+    if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
+      headerLines.push('현재 테스트 대상자가 없다.');
+      try { await sendLongText(message.channel, headerLines.join('\n')); } catch (e) {}
       return;
     }
 
     const names = [];
     for (let i = 0; i < filterConfig.testTargetIds.length; i++) {
-      const state = getFilterState(filterConfig.testTargetIds[i]);
-      if (state) names.push(state.displayName + ' (' + state.userId + ')');
+      const targetId = String(filterConfig.testTargetIds[i]);
+      const state = getFilterState(targetId);
+      if (state) {
+        names.push(state.displayName + ' (' + state.userId + ')');
+        continue;
+      }
+
+      let member = message.guild.members.cache.get(targetId);
+      if (!member) {
+        try { member = await message.guild.members.fetch(targetId); } catch (e) { member = null; }
+      }
+      if (member) names.push(String(member.displayName) + ' (' + targetId + ')');
+      else names.push('알 수 없음 (' + targetId + ')');
     }
 
-    try {
-      await sendLongText(message.channel, [
-        '**테스트 대상자 목록**',
-        '기간: ' + String(filterConfig.periodDays) + '일',
-        '',
-        names.join('\n')
-      ].join('\n'));
-    } catch (e) {}
+    headerLines.push(names.join('\n'));
+    try { await sendLongText(message.channel, headerLines.join('\n')); } catch (e) {}
     return;
   }
 
