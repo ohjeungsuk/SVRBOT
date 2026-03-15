@@ -10,6 +10,15 @@ const Discord = require('discord.js');
 const { google } = require('googleapis');
 const client = new Discord.Client({
   partials: ['MESSAGE', 'CHANNEL', 'REACTION'],
+  ws: {
+    intents: [
+      'GUILDS',
+      'GUILD_MEMBERS',
+      'GUILD_MESSAGES',
+      'GUILD_MESSAGE_REACTIONS',
+      'GUILD_VOICE_STATES',
+    ],
+  },
 });
 
 const prefix = '!';
@@ -30,6 +39,11 @@ const lastDisbandedMemberIds = new Set(); // !해산으로 이동된 사람 id �
 // !팀, !해산 은 아래 텍스트 채널에서만 동작하도록 제한한다.
 const TEAM_COMMAND_TEXT_CHANNEL_ID = '1450859016665432134';
 
+// ---- Activity Filter Command Channel ----
+// 필터 관련 명령은 관리자만 볼 수 있는 이 텍스트 채널에서만 동작한다.
+// 현재는 팀 명령 채널과 동일 ID를 사용한다.
+const FILTER_COMMAND_TEXT_CHANNEL_ID = '1482589757551939675';
+
 // ---- Activity Filter Settings ----
 const FILTER_CHAT_CHANNEL_IDS = [
   '1439240703887671357',
@@ -41,7 +55,7 @@ const FILTER_VOICE_CATEGORY_IDS = [
   '1453251021282476084',
 ];
 const FILTER_VOICE_MINUTES_REQUIRED = 10;
-const FILTER_DEFAULT_PERIOD_DAYS = 14;
+const FILTER_DEFAULT_PERIOD_MINUTES = 1;
 const FILTER_CONFIG_SHEET_TITLE = '활동필터설정';
 const FILTER_STATE_SHEET_TITLE = '활동필터상태';
 const FILTER_LOG_SHEET_TITLE = '활동필터로그';
@@ -72,9 +86,10 @@ const filterTrackedVoiceCategoryIds = new Set(FILTER_VOICE_CATEGORY_IDS.map((v) 
 let filterSheetsReady = false;
 let filterDataReady = false;
 let filterConfig = {
-  periodDays: null,
+  periodMinutes: null,
   periodSetAtKST: '',
   testTargetIds: [],
+  targetMode: 'test',
 };
 const filterStateByUserId = new Map();
 
@@ -100,6 +115,10 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function nowMs() {
+  return Date.now();
+}
+
 function isAdminMember(member) {
   if (!member || !member.hasPermission) return false;
   try { return member.hasPermission('ADMINISTRATOR'); } catch (e) { return false; }
@@ -108,6 +127,25 @@ function isAdminMember(member) {
 function isTeamCommandTextChannel(message) {
   if (!message || !message.channel) return false;
   return String(message.channel.id) === String(TEAM_COMMAND_TEXT_CHANNEL_ID);
+}
+
+function isFilterCommandTextChannel(message) {
+  if (!message || !message.channel) return false;
+  return String(message.channel.id) === String(FILTER_COMMAND_TEXT_CHANNEL_ID);
+}
+
+async function ensureFilterCommandAccess(message) {
+  if (!isAdminMember(message.member)) {
+    try { await message.reply('권한이 없다.'); } catch (e) {}
+    return false;
+  }
+
+  if (!isFilterCommandTextChannel(message)) {
+    try { await message.reply('이 명령어는 관리자 전용 필터 채널에서만 사용할 수 있다.'); } catch (e) {}
+    return false;
+  }
+
+  return true;
 }
 
 // 팀 셔플용: Fisher–Yates 셔플
@@ -267,10 +305,10 @@ async function sendLongText(channel, text) {
   }
 }
 
-function normalizeDaysInput(value) {
+function normalizePeriodMinutesInput(value) {
   const n = parseInt(value, 10);
   if (isNaN(n) || n < 1) return null;
-  if (n > 365) return 365;
+  if (n > 10080) return 10080;
   return n;
 }
 
@@ -422,9 +460,10 @@ async function loadFilterConfigFromSheet() {
 
   const values = res && res.data && res.data.values ? res.data.values : [];
   const nextConfig = {
-    periodDays: null,
+    periodMinutes: null,
     periodSetAtKST: '',
     testTargetIds: [],
+    targetMode: 'test',
   };
 
   for (let i = 0; i < values.length; i++) {
@@ -432,15 +471,17 @@ async function loadFilterConfigFromSheet() {
     const key = row[0] ? String(row[0]) : '';
     const value = row[1] ? String(row[1]) : '';
 
-    if (key === 'period_days') {
-      const n = normalizeDaysInput(value);
-      if (n) nextConfig.periodDays = n;
+    if (key === 'period_minutes' || key === 'period_days') {
+      const n = normalizePeriodMinutesInput(value);
+      if (n) nextConfig.periodMinutes = n;
     } else if (key === 'period_set_at_kst') {
       nextConfig.periodSetAtKST = value ? String(value) : '';
     } else if (key === 'test_target_ids') {
       nextConfig.testTargetIds = value
         ? value.split(',').map((v) => String(v).trim()).filter((v) => v.length > 0)
         : [];
+    } else if (key === 'target_mode') {
+      nextConfig.targetMode = value === 'all' ? 'all' : 'test';
     }
   }
 
@@ -452,15 +493,16 @@ async function saveFilterConfigToSheet() {
 
   const nowKST = formatKSTFromDate(new Date());
   const values = [
-    ['period_days', filterConfig.periodDays ? String(filterConfig.periodDays) : ''],
+    ['period_minutes', filterConfig.periodMinutes ? String(filterConfig.periodMinutes) : ''],
     ['period_set_at_kst', filterConfig.periodSetAtKST || ''],
     ['test_target_ids', (filterConfig.testTargetIds || []).join(',')],
+    ['target_mode', filterConfig.targetMode === 'all' ? 'all' : 'test'],
     ['updated_at', nowKST],
   ];
 
   await sheetsApi.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
-    range: a1Range(FILTER_CONFIG_SHEET_TITLE, 'A2:B5'),
+    range: a1Range(FILTER_CONFIG_SHEET_TITLE, 'A2:B6'),
     valueInputOption: 'RAW',
     requestBody: { values: values },
   });
@@ -529,8 +571,26 @@ function isCurrentTestTargetId(userId) {
   return filterConfig.testTargetIds.indexOf(String(userId)) >= 0;
 }
 
+function isFilterTargetModeAll() {
+  return String(filterConfig && filterConfig.targetMode ? filterConfig.targetMode : 'test') === 'all';
+}
+
+function isFilterTargetUserId(userId) {
+  if (isFilterTargetModeAll()) return true;
+  return isCurrentTestTargetId(userId);
+}
+
 function isFilterPeriodReady() {
-  return !!(filterConfig && filterConfig.periodDays && filterConfig.periodSetAtKST);
+  return !!(filterConfig && filterConfig.periodMinutes && filterConfig.periodSetAtKST);
+}
+
+function getFilterPeriodMs() {
+  const minutes = parseInt(filterConfig && filterConfig.periodMinutes ? filterConfig.periodMinutes : '0', 10) || 0;
+  return minutes * 60 * 1000;
+}
+
+function getFilterTargetModeLabel() {
+  return isFilterTargetModeAll() ? '전체' : '테스트';
 }
 
 function buildEmptyFilterStateForMember(member, nowDate) {
@@ -603,7 +663,7 @@ async function updateFilterActivityForMessage(message, activityType) {
   await ensureFilterDataLoaded();
 
   const userId = String(message.author.id);
-  if (!isCurrentTestTargetId(userId)) return;
+  if (!isFilterTargetUserId(userId)) return;
 
   let state = getFilterState(userId);
   if (!state) {
@@ -667,7 +727,7 @@ async function handleTrackedVoiceTransition(oldState, newState) {
   await ensureFilterDataLoaded();
 
   const userId = String(member.id);
-  if (!isCurrentTestTargetId(userId)) return;
+  if (!isFilterTargetUserId(userId)) return;
 
   let state = getFilterState(userId);
   if (!state) {
@@ -695,11 +755,11 @@ async function handleTrackedVoiceTransition(oldState, newState) {
   }
 }
 
-async function setFilterPeriodDays(days) {
-  filterConfig.periodDays = days;
+async function setFilterPeriodMinutes(minutes) {
+  filterConfig.periodMinutes = minutes;
   filterConfig.periodSetAtKST = formatKSTFromDate(new Date());
   await saveFilterConfigToSheet();
-  await appendFilterLog('PERIOD_SET', null, 'days=' + String(days));
+  await appendFilterLog('PERIOD_SET', null, 'minutes=' + String(minutes));
 }
 
 async function setTestTargetsFromMembers(members) {
@@ -744,6 +804,7 @@ async function setTestTargetsFromMembers(members) {
   }
 
   filterConfig.testTargetIds = newIds;
+  filterConfig.targetMode = 'test';
   await saveFilterConfigToSheet();
 }
 
@@ -765,6 +826,7 @@ async function clearTestTargets() {
   }
 
   filterConfig.testTargetIds = [];
+  filterConfig.targetMode = 'test';
   await saveFilterConfigToSheet();
 }
 
@@ -788,18 +850,75 @@ function buildFilterStatusLine(state, nowDate) {
   }
 
   const elapsedMs = now.getTime() - started.getTime();
-  const periodMs = (filterConfig.periodDays || 0) * 24 * 60 * 60 * 1000;
+  const periodMs = getFilterPeriodMs();
 
   if (elapsedMs < periodMs) {
     const remainMs = periodMs - elapsedMs;
-    const remainHours = Math.ceil(remainMs / 3600000);
-    return state.displayName + ' - 대기중 (남은시간 약 ' + remainHours + '시간, 음성 ' + voiceMinutes + '분)';
+    const remainMinutes = Math.ceil(remainMs / 60000);
+    return state.displayName + ' - 대기중 (남은시간 약 ' + remainMinutes + '분, 음성 ' + voiceMinutes + '분)';
   }
 
   return state.displayName + ' - 미통과 (채팅/구인구직 없음, 음성 ' + voiceMinutes + '분)';
 }
 
-async function runFilterForTestTargets(message) {
+async function setAllTargetsFromGuild(guild) {
+  await ensureFilterDataLoaded();
+
+  if (!guild) throw new Error('guild_not_found');
+
+  let fetchedMembers = null;
+  try {
+    fetchedMembers = await guild.members.fetch();
+  } catch (e) {
+    console.error('[FilterAllTargetsFetchError]', e && e.stack ? e.stack : e);
+    throw e;
+  }
+
+  const nowDate = new Date();
+  const nowKST = formatKSTFromDate(nowDate);
+  const activeIds = [];
+
+  fetchedMembers.forEach((member) => {
+    if (!member || !member.id || !member.user || member.user.bot) return;
+    activeIds.push(String(member.id));
+  });
+
+  const activeIdSet = new Set(activeIds);
+
+  for (let i = 0; i < activeIds.length; i++) {
+    const userId = activeIds[i];
+    const member = fetchedMembers.get(userId);
+    if (!member) continue;
+
+    const existingState = getFilterState(userId);
+    const state = buildEmptyFilterStateForMember(member, nowDate);
+    if (existingState && existingState.rowNumber) state.rowNumber = existingState.rowNumber;
+    await saveFilterState(state);
+    await appendFilterLog('ALL_TARGET_SET', state, 'tracking_start=' + state.trackingStartAtKST);
+
+    if (member.voice && member.voice.channel && isTrackedVoiceChannel(member.voice.channel)) {
+      await startVoiceTrackingForState(state, member.voice.channel, nowDate);
+    }
+  }
+
+  const allStates = Array.from(filterStateByUserId.values());
+  for (let i = 0; i < allStates.length; i++) {
+    const state = allStates[i];
+    if (!state || !state.userId) continue;
+    if (activeIdSet.has(String(state.userId))) continue;
+    state.isTestTarget = 'N';
+    state.lastVoiceJoinAtKST = '';
+    state.lastVoiceChannelId = '';
+    state.updatedAtKST = nowKST;
+    await saveFilterState(state);
+  }
+
+  filterConfig.testTargetIds = activeIds;
+  filterConfig.targetMode = 'all';
+  await saveFilterConfigToSheet();
+}
+
+async function runFilterForCurrentTargets(message) {
   await ensureFilterDataLoaded();
 
   if (!isFilterPeriodReady()) {
@@ -807,8 +926,8 @@ async function runFilterForTestTargets(message) {
     return;
   }
 
-  if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
-    await message.reply('테스트 대상자가 없다. 먼저 !테스트 @대상 형식으로 지정해라.');
+  if ((!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) && !isFilterTargetModeAll()) {
+    await message.reply('테스트 대상자가 없다. 먼저 !테스트 @대상 또는 !테스트 유저ID 형식으로 지정해라.');
     return;
   }
 
@@ -816,9 +935,10 @@ async function runFilterForTestTargets(message) {
   const nowDate = new Date();
   const resultLines = [];
   const kickTargets = [];
+  const targetIds = filterConfig.testTargetIds ? filterConfig.testTargetIds.slice() : [];
 
-  for (let i = 0; i < filterConfig.testTargetIds.length; i++) {
-    const userId = String(filterConfig.testTargetIds[i]);
+  for (let i = 0; i < targetIds.length; i++) {
+    const userId = String(targetIds[i]);
     const state = getFilterState(userId);
     if (!state) continue;
 
@@ -830,7 +950,7 @@ async function runFilterForTestTargets(message) {
     if (!started) continue;
 
     const elapsedMs = nowDate.getTime() - started.getTime();
-    const periodMs = (filterConfig.periodDays || 0) * 24 * 60 * 60 * 1000;
+    const periodMs = getFilterPeriodMs();
     if (elapsedMs < periodMs) continue;
 
     kickTargets.push(state);
@@ -838,8 +958,9 @@ async function runFilterForTestTargets(message) {
 
   await sendLongText(message.channel, [
     '**필터 결과**',
-    '기간: ' + String(filterConfig.periodDays) + '일',
-    '대상: ' + String(filterConfig.testTargetIds.length) + '명',
+    '대상 모드: ' + getFilterTargetModeLabel(),
+    '기간: ' + String(filterConfig.periodMinutes) + '분',
+    '대상: ' + String(targetIds.length) + '명',
     '',
     resultLines.length > 0 ? resultLines.join('\n') : '대상 없음'
   ].join('\n'));
@@ -886,27 +1007,42 @@ async function runFilterForTestTargets(message) {
 async function resolveMentionOrIdMembers(message, rawArgs) {
   const result = [];
   const seen = new Set();
+
+  function pushMember(member) {
+    if (!member || !member.id || !member.user || member.user.bot) return;
+    const id = String(member.id);
+    if (seen.has(id)) return;
+    seen.add(id);
+    result.push(member);
+  }
+
   if (message.mentions && message.mentions.members) {
     message.mentions.members.forEach((member) => {
-      if (!member || !member.id) return;
-      const id = String(member.id);
-      if (seen.has(id)) return;
-      seen.add(id);
-      result.push(member);
+      pushMember(member);
     });
   }
 
   for (let i = 0; i < rawArgs.length; i++) {
     const token = String(rawArgs[i] || '').trim();
-    if (!/^[0-9]{5,}$/.test(token)) continue;
-    if (seen.has(token)) continue;
-    let member = message.guild.members.cache.get(token);
-    if (!member) {
-      try { member = await message.guild.members.fetch(token); } catch (e) { member = null; }
+    if (!token) continue;
+
+    let targetId = '';
+    const mentionMatch = token.match(/^<@!?(\d+)>$/);
+    if (mentionMatch) {
+      targetId = String(mentionMatch[1]);
+    } else if (/^\d{5,}$/.test(token)) {
+      targetId = token;
     }
-    if (!member) continue;
-    seen.add(token);
-    result.push(member);
+
+    if (!targetId) continue;
+    if (seen.has(targetId)) continue;
+
+    let member = message.guild.members.cache.get(targetId);
+    if (!member) {
+      try { member = await message.guild.members.fetch(targetId); } catch (e) { member = null; }
+    }
+
+    pushMember(member);
   }
 
   return result;
@@ -1430,6 +1566,8 @@ setInterval(() => {
 client.on('ready', async () => {
   console.log('[Bot] LoggedInAs:', client.user.tag);
   console.log('[Bot] TARGET_CHANNEL_ID:', TARGET_CHANNEL_ID);
+  console.log('[Bot] FILTER_COMMAND_TEXT_CHANNEL_ID:', FILTER_COMMAND_TEXT_CHANNEL_ID);
+  console.log('[Bot] Intents:', client.options && client.options.ws ? client.options.ws.intents : 'unknown');
   console.log('[Env] DISCORD_TOKEN:', process.env.DISCORD_TOKEN ? 'SET' : 'MISSING');
   console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
 
@@ -1590,27 +1728,21 @@ client.on('message', async (message) => {
   }
 
   if (command === '기간') {
-    if (!isAdminMember(message.member)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
+    if (!(await ensureFilterCommandAccess(message))) return;
+
+    const minutes = normalizePeriodMinutesInput(args[0]);
+    if (!minutes) {
+      try { await message.reply('사용법: !기간 1  (테스트 기준 1 = 1분)'); } catch (e) {}
       return;
     }
 
-    const days = normalizeDaysInput(args[0]);
-    if (!days) {
-      try { await message.reply('사용법: !기간 1'); } catch (e) {}
-      return;
-    }
-
-    await enqueueSheetJob(() => setFilterPeriodDays(days));
-    try { await message.reply('필터 기간을 ' + String(days) + '일로 설정했다. 이제 !테스트 @유저 형식으로 대상자를 지정해라.'); } catch (e) {}
+    await enqueueSheetJob(() => setFilterPeriodMinutes(minutes));
+    try { await message.reply('필터 기간을 ' + String(minutes) + '분으로 설정했다. 이제 !테스트 @유저 또는 !테스트 유저ID 형식으로 대상자를 지정해라.'); } catch (e) {}
     return;
   }
 
   if (command === '테스트') {
-    if (!isAdminMember(message.member)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
-      return;
-    }
+    if (!(await ensureFilterCommandAccess(message))) return;
 
     await ensureFilterDataLoaded();
     if (!isFilterPeriodReady()) {
@@ -1619,8 +1751,9 @@ client.on('message', async (message) => {
     }
 
     const members = await resolveMentionOrIdMembers(message, args);
+    console.log('[TEST_CMD]', 'args=' + JSON.stringify(args), 'resolved=' + JSON.stringify(members.map((m) => String(m.id))));
     if (!members || members.length === 0) {
-      try { await message.reply('사용법: !테스트 @유저1 @유저2'); } catch (e) {}
+      try { await message.reply('대상자를 찾지 못했다. 사용법: !테스트 @유저1 @유저2 또는 !테스트 유저ID1 유저ID2'); } catch (e) {}
       return;
     }
 
@@ -1629,11 +1762,27 @@ client.on('message', async (message) => {
     return;
   }
 
-  if (command === '테스트삭제') {
-    if (!isAdminMember(message.member)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
+  if (command === '전체대상') {
+    if (!(await ensureFilterCommandAccess(message))) return;
+
+    await ensureFilterDataLoaded();
+    if (!isFilterPeriodReady()) {
+      try { await message.reply('먼저 !기간 N 으로 기간부터 설정해라. 예: !기간 1'); } catch (e) {}
       return;
     }
+
+    try {
+      await enqueueSheetJob(() => setAllTargetsFromGuild(message.guild));
+      try { await message.reply('전체 대상 모드로 전환했다. 현재 서버의 봇 제외 전체 유저를 대상으로 설정했다.'); } catch (e) {}
+    } catch (e) {
+      console.error('[SET_ALL_TARGETS_ERROR]', e && e.stack ? e.stack : e);
+      try { await message.reply('전체 대상 설정 실패. 봇의 Server Members Intent 및 권한을 확인해라.'); } catch (ee) {}
+    }
+    return;
+  }
+
+  if (command === '테스트삭제') {
+    if (!(await ensureFilterCommandAccess(message))) return;
 
     await ensureFilterDataLoaded();
     if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
@@ -1642,21 +1791,19 @@ client.on('message', async (message) => {
     }
 
     await enqueueSheetJob(() => clearTestTargets());
-    try { await message.reply('현재 테스트 대상자 설정을 전부 삭제했다.'); } catch (e) {}
+    try { await message.reply('현재 테스트 대상자 설정을 전부 삭제하고 테스트 모드로 초기화했다.'); } catch (e) {}
     return;
   }
 
   if (command === '테스트목록') {
-    if (!isAdminMember(message.member)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
-      return;
-    }
+    if (!(await ensureFilterCommandAccess(message))) return;
 
     await ensureFilterDataLoaded();
 
     const headerLines = [
       '**테스트 대상자 목록**',
-      '기간 설정: ' + (isFilterPeriodReady() ? (String(filterConfig.periodDays) + '일') : '미설정'),
+      '대상 모드: ' + getFilterTargetModeLabel(),
+      '기간 설정: ' + (isFilterPeriodReady() ? (String(filterConfig.periodMinutes) + '분') : '미설정'),
       ''
     ];
 
@@ -1689,12 +1836,9 @@ client.on('message', async (message) => {
   }
 
   if (command === '필터') {
-    if (!isAdminMember(message.member)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
-      return;
-    }
+    if (!(await ensureFilterCommandAccess(message))) return;
 
-    await enqueueSheetJob(() => runFilterForTestTargets(message));
+    await enqueueSheetJob(() => runFilterForCurrentTargets(message));
     return;
   }
 
