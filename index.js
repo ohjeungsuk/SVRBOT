@@ -10,15 +10,6 @@ const Discord = require('discord.js');
 const { google } = require('googleapis');
 const client = new Discord.Client({
   partials: ['MESSAGE', 'CHANNEL', 'REACTION'],
-  ws: {
-    intents: [
-      'GUILDS',
-      'GUILD_MEMBERS',
-      'GUILD_MESSAGES',
-      'GUILD_MESSAGE_REACTIONS',
-      'GUILD_VOICE_STATES',
-    ],
-  },
 });
 
 const prefix = '!';
@@ -39,9 +30,8 @@ const lastDisbandedMemberIds = new Set(); // !해산으로 이동된 사람 id �
 // !팀, !해산 은 아래 텍스트 채널에서만 동작하도록 제한한다.
 const TEAM_COMMAND_TEXT_CHANNEL_ID = '1450859016665432134';
 
-// ---- Activity Filter Command Channel ----
-// 필터 관련 명령은 관리자만 볼 수 있는 이 텍스트 채널에서만 동작한다.
-// 현재는 팀 명령 채널과 동일 ID를 사용한다.
+// ---- 활동필터 명령 채널 기준 ----
+// !기간, !테스트, !테스트삭제, !테스트목록, !필터 는 아래 텍스트 채널에서만 동작한다.
 const FILTER_COMMAND_TEXT_CHANNEL_ID = '1482589757551939675';
 
 // ---- Activity Filter Settings ----
@@ -56,6 +46,7 @@ const FILTER_VOICE_CATEGORY_IDS = [
 ];
 const FILTER_VOICE_MINUTES_REQUIRED = 10;
 const FILTER_DEFAULT_PERIOD_MINUTES = 1;
+const FILTER_AUTO_CHECK_INTERVAL_MS = 10000;
 const FILTER_CONFIG_SHEET_TITLE = '활동필터설정';
 const FILTER_STATE_SHEET_TITLE = '활동필터상태';
 const FILTER_LOG_SHEET_TITLE = '활동필터로그';
@@ -89,9 +80,10 @@ let filterConfig = {
   periodMinutes: null,
   periodSetAtKST: '',
   testTargetIds: [],
-  targetMode: 'test',
+  guildId: '',
 };
 const filterStateByUserId = new Map();
+let filterAutoCheckTimerStarted = false;
 
 const FILTER_STATE_COLUMNS = [
   'userId',
@@ -132,20 +124,6 @@ function isTeamCommandTextChannel(message) {
 function isFilterCommandTextChannel(message) {
   if (!message || !message.channel) return false;
   return String(message.channel.id) === String(FILTER_COMMAND_TEXT_CHANNEL_ID);
-}
-
-async function ensureFilterCommandAccess(message) {
-  if (!isAdminMember(message.member)) {
-    try { await message.reply('권한이 없다.'); } catch (e) {}
-    return false;
-  }
-
-  if (!isFilterCommandTextChannel(message)) {
-    try { await message.reply('이 명령어는 관리자 전용 필터 채널에서만 사용할 수 있다.'); } catch (e) {}
-    return false;
-  }
-
-  return true;
 }
 
 // 팀 셔플용: Fisher–Yates 셔플
@@ -312,6 +290,11 @@ function normalizePeriodMinutesInput(value) {
   return n;
 }
 
+function getFilterPeriodMs() {
+  const minutes = parseInt(filterConfig.periodMinutes || '0', 10) || 0;
+  return minutes * 60 * 1000;
+}
+
 function isFilterTrackedTextChannel(message, channelIdSet) {
   if (!message || !message.channel) return false;
 
@@ -463,7 +446,7 @@ async function loadFilterConfigFromSheet() {
     periodMinutes: null,
     periodSetAtKST: '',
     testTargetIds: [],
-    targetMode: 'test',
+    guildId: '',
   };
 
   for (let i = 0; i < values.length; i++) {
@@ -480,8 +463,8 @@ async function loadFilterConfigFromSheet() {
       nextConfig.testTargetIds = value
         ? value.split(',').map((v) => String(v).trim()).filter((v) => v.length > 0)
         : [];
-    } else if (key === 'target_mode') {
-      nextConfig.targetMode = value === 'all' ? 'all' : 'test';
+    } else if (key === 'guild_id') {
+      nextConfig.guildId = value ? String(value) : '';
     }
   }
 
@@ -496,7 +479,7 @@ async function saveFilterConfigToSheet() {
     ['period_minutes', filterConfig.periodMinutes ? String(filterConfig.periodMinutes) : ''],
     ['period_set_at_kst', filterConfig.periodSetAtKST || ''],
     ['test_target_ids', (filterConfig.testTargetIds || []).join(',')],
-    ['target_mode', filterConfig.targetMode === 'all' ? 'all' : 'test'],
+    ['guild_id', filterConfig.guildId || ''],
     ['updated_at', nowKST],
   ];
 
@@ -563,6 +546,73 @@ async function appendFilterLog(type, memberOrState, detail) {
   });
 }
 
+async function getSheetIdByTitle(title) {
+  await initSheets();
+  const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const sheets = meta && meta.data && meta.data.sheets ? meta.data.sheets : [];
+  for (let i = 0; i < sheets.length; i++) {
+    const p = sheets[i] && sheets[i].properties ? sheets[i].properties : null;
+    if (p && String(p.title) === String(title)) return p.sheetId;
+  }
+  return null;
+}
+
+async function deleteSheetRowsByRowNumbers(sheetTitle, rowNumbers) {
+  if (!rowNumbers || rowNumbers.length === 0) return;
+
+  const sheetId = await getSheetIdByTitle(sheetTitle);
+  if (sheetId === null || sheetId === undefined) return;
+
+  const uniqueSortedDesc = Array.from(new Set(rowNumbers
+    .map((v) => parseInt(v, 10))
+    .filter((v) => !isNaN(v) && v >= 2)))
+    .sort((a, b) => b - a);
+
+  if (uniqueSortedDesc.length === 0) return;
+
+  const requests = [];
+  for (let i = 0; i < uniqueSortedDesc.length; i++) {
+    const rowNumber = uniqueSortedDesc[i];
+    requests.push({
+      deleteDimension: {
+        range: {
+          sheetId: sheetId,
+          dimension: 'ROWS',
+          startIndex: rowNumber - 1,
+          endIndex: rowNumber
+        }
+      }
+    });
+  }
+
+  await sheetsApi.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: { requests: requests },
+  });
+}
+
+async function deleteFilterRowsForUserIdsFromLogSheet(userIds) {
+  if (!userIds || userIds.length === 0) return;
+  await ensureFilterSheetsReady();
+
+  const idSet = new Set(userIds.map((v) => String(v)));
+  const res = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: a1Range(FILTER_LOG_SHEET_TITLE, 'A2:F'),
+  });
+  const values = res && res.data && res.data.values ? res.data.values : [];
+  const rowsToDelete = [];
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i] || [];
+    const userId = row[2] ? String(row[2]) : '';
+    if (!userId) continue;
+    if (idSet.has(userId)) rowsToDelete.push(i + 2);
+  }
+
+  await deleteSheetRowsByRowNumbers(FILTER_LOG_SHEET_TITLE, rowsToDelete);
+}
+
 function getFilterState(userId) {
   return filterStateByUserId.get(String(userId)) || null;
 }
@@ -571,26 +621,8 @@ function isCurrentTestTargetId(userId) {
   return filterConfig.testTargetIds.indexOf(String(userId)) >= 0;
 }
 
-function isFilterTargetModeAll() {
-  return String(filterConfig && filterConfig.targetMode ? filterConfig.targetMode : 'test') === 'all';
-}
-
-function isFilterTargetUserId(userId) {
-  if (isFilterTargetModeAll()) return true;
-  return isCurrentTestTargetId(userId);
-}
-
 function isFilterPeriodReady() {
   return !!(filterConfig && filterConfig.periodMinutes && filterConfig.periodSetAtKST);
-}
-
-function getFilterPeriodMs() {
-  const minutes = parseInt(filterConfig && filterConfig.periodMinutes ? filterConfig.periodMinutes : '0', 10) || 0;
-  return minutes * 60 * 1000;
-}
-
-function getFilterTargetModeLabel() {
-  return isFilterTargetModeAll() ? '전체' : '테스트';
 }
 
 function buildEmptyFilterStateForMember(member, nowDate) {
@@ -663,7 +695,7 @@ async function updateFilterActivityForMessage(message, activityType) {
   await ensureFilterDataLoaded();
 
   const userId = String(message.author.id);
-  if (!isFilterTargetUserId(userId)) return;
+  if (!isCurrentTestTargetId(userId)) return;
 
   let state = getFilterState(userId);
   if (!state) {
@@ -727,7 +759,7 @@ async function handleTrackedVoiceTransition(oldState, newState) {
   await ensureFilterDataLoaded();
 
   const userId = String(member.id);
-  if (!isFilterTargetUserId(userId)) return;
+  if (!isCurrentTestTargetId(userId)) return;
 
   let state = getFilterState(userId);
   if (!state) {
@@ -755,14 +787,15 @@ async function handleTrackedVoiceTransition(oldState, newState) {
   }
 }
 
-async function setFilterPeriodMinutes(minutes) {
+async function setFilterPeriodMinutes(minutes, guildId) {
   filterConfig.periodMinutes = minutes;
   filterConfig.periodSetAtKST = formatKSTFromDate(new Date());
+  if (guildId) filterConfig.guildId = String(guildId);
   await saveFilterConfigToSheet();
   await appendFilterLog('PERIOD_SET', null, 'minutes=' + String(minutes));
 }
 
-async function setTestTargetsFromMembers(members) {
+async function setTestTargetsFromMembers(members, guildId) {
   await ensureFilterDataLoaded();
 
   const uniqueMap = new Map();
@@ -775,6 +808,8 @@ async function setTestTargetsFromMembers(members) {
   const nowDate = new Date();
   const nowKST = formatKSTFromDate(nowDate);
   const newIds = Array.from(uniqueMap.keys());
+
+  if (guildId) filterConfig.guildId = String(guildId);
 
   const oldIds = filterConfig.testTargetIds ? filterConfig.testTargetIds.slice() : [];
   for (let i = 0; i < oldIds.length; i++) {
@@ -804,30 +839,27 @@ async function setTestTargetsFromMembers(members) {
   }
 
   filterConfig.testTargetIds = newIds;
-  filterConfig.targetMode = 'test';
   await saveFilterConfigToSheet();
 }
 
 async function clearTestTargets() {
   await ensureFilterDataLoaded();
 
-  const nowKST = formatKSTFromDate(new Date());
   const oldIds = filterConfig.testTargetIds ? filterConfig.testTargetIds.slice() : [];
+  const stateRowNumbers = [];
 
   for (let i = 0; i < oldIds.length; i++) {
     const state = getFilterState(oldIds[i]);
     if (!state) continue;
-    state.isTestTarget = 'N';
-    state.lastVoiceJoinAtKST = '';
-    state.lastVoiceChannelId = '';
-    state.updatedAtKST = nowKST;
-    await saveFilterState(state);
-    await appendFilterLog('TEST_TARGET_CLEAR', state, 'cleared');
+    if (state.rowNumber) stateRowNumbers.push(state.rowNumber);
   }
 
+  await deleteFilterRowsForUserIdsFromLogSheet(oldIds);
+  await deleteSheetRowsByRowNumbers(FILTER_STATE_SHEET_TITLE, stateRowNumbers);
+
   filterConfig.testTargetIds = [];
-  filterConfig.targetMode = 'test';
   await saveFilterConfigToSheet();
+  await loadFilterStateFromSheet();
 }
 
 function buildFilterStatusLine(state, nowDate) {
@@ -861,84 +893,84 @@ function buildFilterStatusLine(state, nowDate) {
   return state.displayName + ' - 미통과 (채팅/구인구직 없음, 음성 ' + voiceMinutes + '분)';
 }
 
-async function setAllTargetsFromGuild(guild) {
-  await ensureFilterDataLoaded();
+async function runFilterKickFlowForStates(guild, notifyChannel, kickTargets, triggerLabel, triggerUser) {
+  for (let i = 0; i < kickTargets.length; i++) {
+    const state = kickTargets[i];
+    let member = guild.members.cache.get(String(state.userId));
+    if (!member) {
+      try { member = await guild.members.fetch(String(state.userId)); } catch (e) { member = null; }
+    }
 
-  if (!guild) throw new Error('guild_not_found');
+    if (!member) {
+      await appendFilterLog('KICK_SKIP', state, 'member_not_found trigger=' + String(triggerLabel || 'auto'));
+      continue;
+    }
 
-  let fetchedMembers = null;
-  try {
-    fetchedMembers = await guild.members.fetch();
-  } catch (e) {
-    console.error('[FilterAllTargetsFetchError]', e && e.stack ? e.stack : e);
-    throw e;
-  }
+    if (!member.kickable) {
+      await appendFilterLog('KICK_SKIP', state, 'member_not_kickable trigger=' + String(triggerLabel || 'auto'));
+      try { if (notifyChannel) await notifyChannel.send(state.displayName + ' 강퇴 실패: 봇 권한 또는 역할 순서를 확인해라.'); } catch (e) {}
+      continue;
+    }
 
-  const nowDate = new Date();
-  const nowKST = formatKSTFromDate(nowDate);
-  const activeIds = [];
+    const reason = '필터 기간 내 활동 조건 미충족';
+    try {
+      await member.send('귀하께서는 지정된 테스트 기간 동안 활동 조건을 충족하지 않아 퇴출되었습니다.');
+    } catch (e) {}
 
-  fetchedMembers.forEach((member) => {
-    if (!member || !member.id || !member.user || member.user.bot) return;
-    activeIds.push(String(member.id));
-  });
+    try {
+      await member.kick(reason);
+      const nowDate = new Date();
+      const nowKST = formatKSTFromDate(nowDate);
+      state.kicked = 'Y';
+      state.kickedAtKST = nowKST;
+      state.updatedAtKST = nowKST;
+      await saveFilterState(state);
 
-  const activeIdSet = new Set(activeIds);
+      const triggerDisplay = triggerUser
+        ? (String(triggerUser.displayName || triggerUser.username || triggerUser.user && triggerUser.user.username || '관리자'))
+        : '자동필터';
+      const detail = [
+        'reason=' + reason,
+        'kicked_at=' + nowKST,
+        'trigger=' + String(triggerLabel || 'auto'),
+        'by=' + triggerDisplay,
+        'by_id=' + String(triggerUser && triggerUser.id ? triggerUser.id : 'AUTO'),
+        'channel=' + String(notifyChannel && notifyChannel.id ? notifyChannel.id : '')
+      ].join(' ');
+      await appendFilterLog('KICKED', state, detail);
 
-  for (let i = 0; i < activeIds.length; i++) {
-    const userId = activeIds[i];
-    const member = fetchedMembers.get(userId);
-    if (!member) continue;
-
-    const existingState = getFilterState(userId);
-    const state = buildEmptyFilterStateForMember(member, nowDate);
-    if (existingState && existingState.rowNumber) state.rowNumber = existingState.rowNumber;
-    await saveFilterState(state);
-    await appendFilterLog('ALL_TARGET_SET', state, 'tracking_start=' + state.trackingStartAtKST);
-
-    if (member.voice && member.voice.channel && isTrackedVoiceChannel(member.voice.channel)) {
-      await startVoiceTrackingForState(state, member.voice.channel, nowDate);
+      try {
+        if (notifyChannel) {
+          await sendLongText(notifyChannel, [
+            '**퇴출 완료**',
+            '대상: ' + state.displayName + ' (' + state.userId + ')',
+            '시간: ' + nowKST,
+            '처리: ' + String(triggerLabel || 'auto'),
+            '처리자: ' + triggerDisplay
+          ].join('\n'));
+        }
+      } catch (e) {}
+    } catch (e) {
+      await appendFilterLog('KICK_FAIL', state, 'trigger=' + String(triggerLabel || 'auto') + ' error=' + (e && e.message ? e.message : 'unknown_error'));
+      try { if (notifyChannel) await notifyChannel.send(state.displayName + ' 강퇴 실패: ' + (e && e.message ? e.message : '알 수 없는 오류')); } catch (ee) {}
     }
   }
-
-  const allStates = Array.from(filterStateByUserId.values());
-  for (let i = 0; i < allStates.length; i++) {
-    const state = allStates[i];
-    if (!state || !state.userId) continue;
-    if (activeIdSet.has(String(state.userId))) continue;
-    state.isTestTarget = 'N';
-    state.lastVoiceJoinAtKST = '';
-    state.lastVoiceChannelId = '';
-    state.updatedAtKST = nowKST;
-    await saveFilterState(state);
-  }
-
-  filterConfig.testTargetIds = activeIds;
-  filterConfig.targetMode = 'all';
-  await saveFilterConfigToSheet();
 }
 
-async function runFilterForCurrentTargets(message) {
+async function evaluateKickTargets() {
   await ensureFilterDataLoaded();
 
-  if (!isFilterPeriodReady()) {
-    await message.reply('먼저 !기간 N 으로 기간부터 설정해라. 예: !기간 1');
-    return;
-  }
-
-  if ((!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) && !isFilterTargetModeAll()) {
-    await message.reply('테스트 대상자가 없다. 먼저 !테스트 @대상 또는 !테스트 유저ID 형식으로 지정해라.');
-    return;
-  }
-
-  const guild = message.guild;
   const nowDate = new Date();
   const resultLines = [];
   const kickTargets = [];
-  const targetIds = filterConfig.testTargetIds ? filterConfig.testTargetIds.slice() : [];
 
-  for (let i = 0; i < targetIds.length; i++) {
-    const userId = String(targetIds[i]);
+  if (!isFilterPeriodReady()) {
+    return { nowDate: nowDate, resultLines: resultLines, kickTargets: kickTargets };
+  }
+
+  const periodMs = getFilterPeriodMs();
+  for (let i = 0; i < (filterConfig.testTargetIds || []).length; i++) {
+    const userId = String(filterConfig.testTargetIds[i]);
     const state = getFilterState(userId);
     if (!state) continue;
 
@@ -950,57 +982,67 @@ async function runFilterForCurrentTargets(message) {
     if (!started) continue;
 
     const elapsedMs = nowDate.getTime() - started.getTime();
-    const periodMs = getFilterPeriodMs();
     if (elapsedMs < periodMs) continue;
 
     kickTargets.push(state);
   }
 
+  return { nowDate: nowDate, resultLines: resultLines, kickTargets: kickTargets };
+}
+
+async function runFilterForTestTargets(message) {
+  await ensureFilterDataLoaded();
+
+  if (!isFilterPeriodReady()) {
+    await message.reply('먼저 !기간 N 으로 기간부터 설정해라. 예: !기간 1');
+    return;
+  }
+
+  if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
+    await message.reply('테스트 대상자가 없다. 먼저 !테스트 @대상 형식으로 지정해라.');
+    return;
+  }
+
+  const guild = message.guild;
+  const evalResult = await evaluateKickTargets();
+
   await sendLongText(message.channel, [
     '**필터 결과**',
-    '대상 모드: ' + getFilterTargetModeLabel(),
     '기간: ' + String(filterConfig.periodMinutes) + '분',
-    '대상: ' + String(targetIds.length) + '명',
+    '대상: ' + String(filterConfig.testTargetIds.length) + '명',
     '',
-    resultLines.length > 0 ? resultLines.join('\n') : '대상 없음'
+    evalResult.resultLines.length > 0 ? evalResult.resultLines.join('\n') : '대상 없음'
   ].join('\n'));
 
-  for (let i = 0; i < kickTargets.length; i++) {
-    const state = kickTargets[i];
-    let member = guild.members.cache.get(String(state.userId));
-    if (!member) {
-      try { member = await guild.members.fetch(String(state.userId)); } catch (e) { member = null; }
+  await runFilterKickFlowForStates(guild, message.channel, evalResult.kickTargets, 'manual', message.member);
+}
+
+async function runAutomaticFilterCheck() {
+  try {
+    await initSheets();
+    await loadFilterConfigFromSheet();
+    await loadFilterStateFromSheet();
+    filterDataReady = true;
+
+    if (!isFilterPeriodReady()) return;
+    if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) return;
+
+    let guild = null;
+    if (filterConfig.guildId) guild = client.guilds.cache.get(String(filterConfig.guildId));
+    if (!guild) guild = client.guilds.cache.first() || null;
+    if (!guild) return;
+
+    let notifyChannel = guild.channels.cache.get(String(FILTER_COMMAND_TEXT_CHANNEL_ID));
+    if (!notifyChannel) {
+      try { notifyChannel = await guild.channels.fetch(String(FILTER_COMMAND_TEXT_CHANNEL_ID)); } catch (e) { notifyChannel = null; }
     }
 
-    if (!member) {
-      await appendFilterLog('KICK_SKIP', state, 'member_not_found');
-      continue;
-    }
+    const evalResult = await evaluateKickTargets();
+    if (!evalResult.kickTargets || evalResult.kickTargets.length === 0) return;
 
-    if (!member.kickable) {
-      await appendFilterLog('KICK_SKIP', state, 'member_not_kickable');
-      try { await message.channel.send(state.displayName + ' 강퇴 실패: 봇 권한 또는 역할 순서를 확인해라.'); } catch (e) {}
-      continue;
-    }
-
-    const reason = '필터 기간 내 활동 조건 미충족';
-    try {
-      await member.send('귀하께서는 지정된 테스트 기간 동안 활동 조건을 충족하지 않아 퇴출되었습니다.');
-    } catch (e) {}
-
-    try {
-      await member.kick(reason);
-      const nowKST = formatKSTFromDate(new Date());
-      state.kicked = 'Y';
-      state.kickedAtKST = nowKST;
-      state.updatedAtKST = nowKST;
-      await saveFilterState(state);
-      await appendFilterLog('KICKED', state, 'reason=' + reason);
-      try { await message.channel.send(state.displayName + ' 퇴출 완료'); } catch (e) {}
-    } catch (e) {
-      await appendFilterLog('KICK_FAIL', state, e && e.message ? e.message : 'unknown_error');
-      try { await message.channel.send(state.displayName + ' 강퇴 실패: ' + (e && e.message ? e.message : '알 수 없는 오류')); } catch (ee) {}
-    }
+    await runFilterKickFlowForStates(guild, notifyChannel, evalResult.kickTargets, 'auto', null);
+  } catch (e) {
+    console.error('[AutoFilterCheckError]', e && e.stack ? e.stack : e);
   }
 }
 
@@ -1009,7 +1051,7 @@ async function resolveMentionOrIdMembers(message, rawArgs) {
   const seen = new Set();
 
   function pushMember(member) {
-    if (!member || !member.id || !member.user || member.user.bot) return;
+    if (!member || !member.id) return;
     const id = String(member.id);
     if (seen.has(id)) return;
     seen.add(id);
@@ -1028,11 +1070,8 @@ async function resolveMentionOrIdMembers(message, rawArgs) {
 
     let targetId = '';
     const mentionMatch = token.match(/^<@!?(\d+)>$/);
-    if (mentionMatch) {
-      targetId = String(mentionMatch[1]);
-    } else if (/^\d{5,}$/.test(token)) {
-      targetId = token;
-    }
+    if (mentionMatch) targetId = String(mentionMatch[1]);
+    else if (/^\d{5,}$/.test(token)) targetId = token;
 
     if (!targetId) continue;
     if (seen.has(targetId)) continue;
@@ -1041,7 +1080,6 @@ async function resolveMentionOrIdMembers(message, rawArgs) {
     if (!member) {
       try { member = await message.guild.members.fetch(targetId); } catch (e) { member = null; }
     }
-
     pushMember(member);
   }
 
@@ -1566,14 +1604,18 @@ setInterval(() => {
 client.on('ready', async () => {
   console.log('[Bot] LoggedInAs:', client.user.tag);
   console.log('[Bot] TARGET_CHANNEL_ID:', TARGET_CHANNEL_ID);
-  console.log('[Bot] FILTER_COMMAND_TEXT_CHANNEL_ID:', FILTER_COMMAND_TEXT_CHANNEL_ID);
-  console.log('[Bot] Intents:', client.options && client.options.ws ? client.options.ws.intents : 'unknown');
   console.log('[Env] DISCORD_TOKEN:', process.env.DISCORD_TOKEN ? 'SET' : 'MISSING');
   console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
 
   try {
     await initSheets();
     await ensureFilterDataLoaded();
+    if (!filterAutoCheckTimerStarted) {
+      filterAutoCheckTimerStarted = true;
+      setInterval(() => {
+        enqueueSheetJob(() => runAutomaticFilterCheck());
+      }, FILTER_AUTO_CHECK_INTERVAL_MS);
+    }
   } catch (e) {
     console.error('[SheetsInitFailed]', e && e.stack ? e.stack : e);
   }
@@ -1720,6 +1762,18 @@ client.on('message', async (message) => {
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
+  const isFilterCommand = (
+    command === '기간' ||
+    command === '테스트' ||
+    command === '테스트삭제' ||
+    command === '테스트목록' ||
+    command === '필터'
+  );
+
+  if (isFilterCommand && !isFilterCommandTextChannel(message)) {
+    try { await message.reply('이 명령어는 관리자 전용 필터 채널에서만 사용할 수 있다.'); } catch (e) {}
+    return;
+  }
 
   if (command === '백업') {
     console.log('[Backup] command received by', message.author.tag);
@@ -1728,21 +1782,27 @@ client.on('message', async (message) => {
   }
 
   if (command === '기간') {
-    if (!(await ensureFilterCommandAccess(message))) return;
-
-    const minutes = normalizePeriodMinutesInput(args[0]);
-    if (!minutes) {
-      try { await message.reply('사용법: !기간 1  (테스트 기준 1 = 1분)'); } catch (e) {}
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
       return;
     }
 
-    await enqueueSheetJob(() => setFilterPeriodMinutes(minutes));
-    try { await message.reply('필터 기간을 ' + String(minutes) + '분으로 설정했다. 이제 !테스트 @유저 또는 !테스트 유저ID 형식으로 대상자를 지정해라.'); } catch (e) {}
+    const minutes = normalizePeriodMinutesInput(args[0]);
+    if (!minutes) {
+      try { await message.reply('사용법: !기간 1'); } catch (e) {}
+      return;
+    }
+
+    await enqueueSheetJob(() => setFilterPeriodMinutes(minutes, message.guild ? message.guild.id : ''));
+    try { await message.reply('필터 기간을 ' + String(minutes) + '분으로 설정했다. 이제 !테스트 @유저 형식으로 대상자를 지정해라.'); } catch (e) {}
     return;
   }
 
   if (command === '테스트') {
-    if (!(await ensureFilterCommandAccess(message))) return;
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
 
     await ensureFilterDataLoaded();
     if (!isFilterPeriodReady()) {
@@ -1751,38 +1811,21 @@ client.on('message', async (message) => {
     }
 
     const members = await resolveMentionOrIdMembers(message, args);
-    console.log('[TEST_CMD]', 'args=' + JSON.stringify(args), 'resolved=' + JSON.stringify(members.map((m) => String(m.id))));
     if (!members || members.length === 0) {
-      try { await message.reply('대상자를 찾지 못했다. 사용법: !테스트 @유저1 @유저2 또는 !테스트 유저ID1 유저ID2'); } catch (e) {}
+      try { await message.reply('사용법: !테스트 @유저1 @유저2 또는 !테스트 유저ID'); } catch (e) {}
       return;
     }
 
-    await enqueueSheetJob(() => setTestTargetsFromMembers(members));
+    await enqueueSheetJob(() => setTestTargetsFromMembers(members, message.guild ? message.guild.id : ''));
     try { await message.reply('테스트 대상자 설정 완료: ' + members.map((m) => String(m.displayName)).join(', ')); } catch (e) {}
     return;
   }
 
-  if (command === '전체대상') {
-    if (!(await ensureFilterCommandAccess(message))) return;
-
-    await ensureFilterDataLoaded();
-    if (!isFilterPeriodReady()) {
-      try { await message.reply('먼저 !기간 N 으로 기간부터 설정해라. 예: !기간 1'); } catch (e) {}
+  if (command === '테스트삭제') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
       return;
     }
-
-    try {
-      await enqueueSheetJob(() => setAllTargetsFromGuild(message.guild));
-      try { await message.reply('전체 대상 모드로 전환했다. 현재 서버의 봇 제외 전체 유저를 대상으로 설정했다.'); } catch (e) {}
-    } catch (e) {
-      console.error('[SET_ALL_TARGETS_ERROR]', e && e.stack ? e.stack : e);
-      try { await message.reply('전체 대상 설정 실패. 봇의 Server Members Intent 및 권한을 확인해라.'); } catch (ee) {}
-    }
-    return;
-  }
-
-  if (command === '테스트삭제') {
-    if (!(await ensureFilterCommandAccess(message))) return;
 
     await ensureFilterDataLoaded();
     if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) {
@@ -1791,18 +1834,20 @@ client.on('message', async (message) => {
     }
 
     await enqueueSheetJob(() => clearTestTargets());
-    try { await message.reply('현재 테스트 대상자 설정을 전부 삭제하고 테스트 모드로 초기화했다.'); } catch (e) {}
+    try { await message.reply('현재 테스트 대상자 설정을 전부 삭제했다.'); } catch (e) {}
     return;
   }
 
   if (command === '테스트목록') {
-    if (!(await ensureFilterCommandAccess(message))) return;
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
 
     await ensureFilterDataLoaded();
 
     const headerLines = [
       '**테스트 대상자 목록**',
-      '대상 모드: ' + getFilterTargetModeLabel(),
       '기간 설정: ' + (isFilterPeriodReady() ? (String(filterConfig.periodMinutes) + '분') : '미설정'),
       ''
     ];
@@ -1836,9 +1881,12 @@ client.on('message', async (message) => {
   }
 
   if (command === '필터') {
-    if (!(await ensureFilterCommandAccess(message))) return;
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
 
-    await enqueueSheetJob(() => runFilterForCurrentTargets(message));
+    await enqueueSheetJob(() => runFilterForTestTargets(message));
     return;
   }
 
