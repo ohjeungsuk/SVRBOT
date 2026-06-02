@@ -53,6 +53,17 @@ const lastDisbandedMemberIds = new Set(); // !해산으로 이동된 사람 id �
 // ---- 팀/해산 명령 채널 기준 ----
 // !팀, !해산 은 아래 텍스트 채널에서만 동작하도록 제한한다.
 const TEAM_COMMAND_TEXT_CHANNEL_ID = '1450859016665432134';
+const TEAM_DISBAND_VOICE_CHANNEL_IDS = [
+  '1450857003521015921', '1450857559715217560', '1450857466312261786',
+  '1450857664388005980', '1450857791789989971', '1450857978289983568',
+  '1450858008027336844', '1450858203570110608', '1451547463554170930',
+  '1451547521531773029',
+];
+const TEAM_MODE_OPTIONS = [
+  { label: '솔로', size: 1 },
+  { label: '듀오', size: 2 },
+  { label: '스쿼드', size: 4 },
+];
 
 // ---- 활동필터 명령 채널 기준 ----
 // !기간, !테스트, !테스트삭제, !테스트목록, !필터 는 아래 텍스트 채널에서만 동작한다.
@@ -215,6 +226,7 @@ function buildTeamsFromMembersArray(membersArray, teamSize) {
 // 이전 팀(latestTeams)과 새 팀(teamsMembers)이 얼마나 비슷한지 평가
 // 반환: { ratio } - 1.0에 가까울수록 "이전 팀과 많이 비슷", 0에 가까울수록 "많이 다름"
 function evaluateTeamDifference(prevTeams, newTeamsMembers) {
+
   if (!prevTeams || !Array.isArray(prevTeams) || prevTeams.length === 0) {
     // 비교 기준이 없으면 "완전 새로"라고 보고 ratio 0.0 취급
     return { ratio: 0.0 };
@@ -302,6 +314,231 @@ function evaluateTeamDifference(prevTeams, newTeamsMembers) {
   return { ratio: ratio };
 }
 
+function getTeamModeLabel(teamSize) {
+  for (let i = 0; i < TEAM_MODE_OPTIONS.length; i++) {
+    if (TEAM_MODE_OPTIONS[i].size === teamSize) return TEAM_MODE_OPTIONS[i].label;
+  }
+  return String(teamSize) + '인 팀';
+}
+
+function getTeamMembersFromVoiceChannel(voiceChannel) {
+  if (!voiceChannel || !voiceChannel.members) return [];
+  return Array.from(voiceChannel.members.filter((m) => {
+    const name = m.displayName || m.user.username || '';
+    return !m.user.bot && !RECRUIT_SPECTATOR_TAG.test(name);
+  }).values());
+}
+
+function createBalancedTeams(members, teamSize) {
+  const prevTeamsForCompare = (latestTeams && Array.isArray(latestTeams) && latestTeams.length > 0) ? latestTeams : null;
+  const MAX_RETRY = 12;
+  const MAX_SIMILAR_RATIO = 0.4;
+  let bestTeamsMembers = null;
+  let bestRatio = 1.0;
+
+  if (!prevTeamsForCompare) {
+    bestTeamsMembers = buildTeamsFromMembersArray(shuffleArray(members), teamSize);
+    bestRatio = 0.0;
+  } else {
+    for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
+      const candidateTeams = buildTeamsFromMembersArray(shuffleArray(members), teamSize);
+      const diff = evaluateTeamDifference(prevTeamsForCompare, candidateTeams);
+      if (diff.ratio < bestRatio) {
+        bestRatio = diff.ratio;
+        bestTeamsMembers = candidateTeams;
+      }
+      if (diff.ratio <= MAX_SIMILAR_RATIO) break;
+    }
+  }
+
+  if (!bestTeamsMembers) {
+    bestTeamsMembers = buildTeamsFromMembersArray(shuffleArray(members), teamSize);
+    bestRatio = 1.0;
+  }
+  return { teamsMembers: bestTeamsMembers, similarRatio: bestRatio };
+}
+
+function buildTeamModeComponents(userId) {
+  const row = new ActionRowBuilder();
+  for (let i = 0; i < TEAM_MODE_OPTIONS.length; i++) {
+    const option = TEAM_MODE_OPTIONS[i];
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(['team_size', userId, String(option.size)].join(':'))
+        .setLabel(option.label)
+        .setStyle(option.size === 4 ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    );
+  }
+  return [row];
+}
+
+function buildTeamDisbandConfirmComponents(userId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(['team_disband_yes', userId].join(':'))
+      .setLabel('예, 각 팀방으로 이동')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(['team_disband_no', userId].join(':'))
+      .setLabel('아니요, 결과만 유지')
+      .setStyle(ButtonStyle.Secondary)
+  )];
+}
+
+function buildTeamResultEmbed(teamsMembers, teamSize, voiceChannel, actorMember) {
+  const modeLabel = getTeamModeLabel(teamSize);
+  const totalMembers = teamsMembers.reduce((sum, team) => sum + team.length, 0);
+  const selectedTeamIndex = Math.floor(Math.random() * teamsMembers.length);
+  const randomMessage = '오늘은 Team ' + (selectedTeamIndex + 1) + '이 분위기 좀 탑니다.';
+  const embed = new EmbedBuilder()
+    .setColor(0x5b8def)
+    .setTitle(modeLabel + ' 팀 편성 완료')
+    .setDescription(
+      '**' + String(voiceChannel.name || '음성채널') + '** 기준으로 관전자 제외 인원을 섞었습니다.\n' +
+      '아래 버튼에서 바로 각 팀방 이동 여부를 선택할 수 있습니다.'
+    )
+    .addFields(
+      { name: '편성 정보', value: '**' + totalMembers + '명 참여** · **' + teamsMembers.length + '팀 구성** · **' + modeLabel + '**', inline: false }
+    )
+    .setFooter({ text: randomMessage + ' · 요청자: ' + String(actorMember.displayName || actorMember.user.username) })
+    .setTimestamp();
+
+  const maxTeamFields = 24;
+  const visibleTeamCount = Math.min(teamsMembers.length, maxTeamFields);
+  for (let i = 0; i < visibleTeamCount; i++) {
+    const team = teamsMembers[i];
+    const value = team.map((member) => String(member.displayName) + ' <@' + String(member.id) + '>').join('\n') || '비어 있음';
+    embed.addFields({ name: 'Team ' + (i + 1) + ' · ' + team.length + '명', value: value, inline: false });
+  }
+  if (teamsMembers.length > visibleTeamCount) {
+    embed.addFields({ name: '추가 팀', value: '임베드 표시 제한으로 ' + (teamsMembers.length - visibleTeamCount) + '팀은 생략했습니다. `!팀 2` 또는 `!팀 4` 사용을 권장합니다.', inline: false });
+  }
+  return embed;
+}
+
+async function sendTeamModeMenu(message) {
+  const embed = new EmbedBuilder()
+    .setColor(0x5b8def)
+    .setTitle('팀짜기 모드 선택')
+    .setDescription('현재 음성 채널 인원으로 팀을 나눕니다. 원하는 모드를 선택하세요.\n`[관전]` 표시는 팀 구성에서 제외됩니다.')
+    .addFields(
+      { name: '솔로', value: '1명씩 나눕니다.', inline: true },
+      { name: '듀오', value: '2명씩 나눕니다.', inline: true },
+      { name: '스쿼드', value: '4명씩 나눕니다.', inline: true }
+    )
+    .setTimestamp();
+  await message.channel.send({ embeds: [embed], components: buildTeamModeComponents(message.author.id) });
+}
+
+async function executeTeamBuild(channel, guild, actorMember, teamSize, actorUserId) {
+  if (!guild || !actorMember) return false;
+  const voiceChannel = actorMember.voice ? actorMember.voice.channel : null;
+  if (!voiceChannel) {
+    await channel.send('먼저 음성 채널에 들어가 주세요.');
+    return false;
+  }
+
+  const members = getTeamMembersFromVoiceChannel(voiceChannel);
+  if (members.length < teamSize) {
+    await channel.send('음성 채널 인원이 부족합니다. 관전자와 봇은 팀 구성에서 제외됩니다.');
+    return false;
+  }
+
+  const result = createBalancedTeams(members, teamSize);
+  const teamsMembers = result.teamsMembers;
+  latestTeams = teamsMembers.map((team) => team.map((m) => String(m.id)));
+  latestTeamsMeta = {
+    guildId: String(guild.id),
+    textChannelId: String(channel.id),
+    voiceChannelId: String(voiceChannel.id),
+    createdAtMs: nowMs(),
+  };
+
+  const embed = buildTeamResultEmbed(teamsMembers, teamSize, voiceChannel, actorMember);
+  const mentions = members.map((m) => '<@' + String(m.id) + '>').join(' ');
+  await channel.send({
+    content: mentions ? '참가자: ' + mentions : '',
+    embeds: [embed],
+    components: buildTeamDisbandConfirmComponents(actorUserId || actorMember.id),
+    allowedMentions: { users: members.map((m) => String(m.id)) },
+  });
+  return true;
+}
+
+async function executeLatestTeamDisband(guild) {
+  if (!guild || !latestTeams || latestTeams.length === 0) return { moved: 0, reason: 'noTeams' };
+  lastDisbandedMemberIds.clear();
+  let moved = 0;
+
+  for (let i = 0; i < latestTeams.length; i++) {
+    const channelId = TEAM_DISBAND_VOICE_CHANNEL_IDS[i];
+    const channel = guild.channels.cache.get(String(channelId));
+    if (!channel || !isVoiceChannel(channel)) continue;
+
+    const team = latestTeams[i];
+    for (let j = 0; j < team.length; j++) {
+      const memberId = String(team[j]);
+      const member = guild.members.cache.get(memberId);
+      if (!member || !member.voice || !member.voice.channel) continue;
+      try {
+        await member.voice.setChannel(channel);
+        lastDisbandedMemberIds.add(String(member.id));
+        moved++;
+      } catch (err) {
+        console.error('[TeamDisband] move failed:', member.displayName, err && err.message ? err.message : err);
+      }
+    }
+  }
+
+  return { moved: moved, reason: '' };
+}
+
+async function handleTeamComponent(interaction) {
+  const parts = String(interaction.customId || '').split(':');
+  const action = parts[0];
+  const userId = parts[1];
+
+  if (!interaction.guild) return;
+  if (!isAdminMember(interaction.member)) {
+    await interaction.reply({ content: '권한이 없습니다.', ephemeral: true });
+    return;
+  }
+  if (String(interaction.channelId) !== String(TEAM_COMMAND_TEXT_CHANNEL_ID)) {
+    await interaction.reply({ content: '이 버튼은 지정된 팀짜기 채널에서만 사용할 수 있습니다.', ephemeral: true });
+    return;
+  }
+  if (userId && String(interaction.user.id) !== String(userId)) {
+    await interaction.reply({ content: '이 버튼은 명령어를 실행한 사람만 사용할 수 있습니다.', ephemeral: true });
+    return;
+  }
+
+  if (action === 'team_size') {
+    const teamSize = parseInt(parts[2] || '0', 10);
+    if (!teamSize || teamSize < 1) {
+      await interaction.reply({ content: '팀 인원 값을 확인할 수 없습니다.', ephemeral: true });
+      return;
+    }
+    await interaction.update({ content: getTeamModeLabel(teamSize) + ' 팀짜기를 시작합니다.', embeds: [], components: [] });
+    await executeTeamBuild(interaction.channel, interaction.guild, interaction.member, teamSize, interaction.user.id);
+    return;
+  }
+
+  if (action === 'team_disband_yes') {
+    await interaction.update({ content: '각 팀방으로 이동을 시작합니다.', embeds: interaction.message.embeds, components: [] });
+    const result = await executeLatestTeamDisband(interaction.guild);
+    if (result.reason === 'noTeams') {
+      await interaction.followUp({ content: '먼저 !팀 명령어로 팀을 구성해주세요.', ephemeral: true });
+      return;
+    }
+    await interaction.followUp({ content: '팀 해산 완료: ' + result.moved + '명을 각 팀방으로 이동했습니다.', ephemeral: true });
+    return;
+  }
+
+  if (action === 'team_disband_no') {
+    await interaction.update({ content: '팀방 이동은 취소했습니다. 마지막 팀 결과는 유지되므로 `!해산`으로 나중에 이동할 수 있습니다.', embeds: interaction.message.embeds, components: [] });
+  }
+}
+
 // 시트 작업은 기능별 큐로 나눠서 오래 걸리는 작업이 다른 기능을 막지 않게 한다.
 const sheetQueues = {
   default: Promise.resolve(),
@@ -345,8 +582,8 @@ function buildHelpText(isAdmin) {
     '`!도움말` 또는 `!명령어` - 봇 명령어 안내를 보여준다.',
     '',
     '**관리자 명령어**',
-    '`!팀 인원수` - 현재 음성 채널 인원을 지정한 인원수 단위로 랜덤 팀 편성한다. `[관전]` 표시는 제외된다.',
-    '`!해산` - 마지막으로 만든 팀을 지정된 팀 음성방으로 이동한다.',
+    '`!팀` - 솔로/듀오/스쿼드 버튼으로 팀을 편성한다. `!팀 2`처럼 기존 숫자 방식도 사용할 수 있다. `[관전]` 표시는 제외된다.',
+    '`!해산` - 마지막 팀 결과를 각 팀 음성방으로 이동한다. 팀 결과 버튼의 `예`로도 바로 이동할 수 있다.',
     '`!복귀` - 마지막 `!해산`으로 이동된 인원을 대기실로 이동한다.',
     '`/전부이동` - 현재 음성 채널 인원을 사용자에게만 보이는 선택 메뉴로 이동한다. 기존 음성채널 또는 파티 생성 항목을 선택할 수 있다.',
     '`!백업` - 외출 신청 채널의 양식 메시지를 새 구글 시트 탭으로 백업한다.',
@@ -2239,6 +2476,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const customId = String(interaction.customId || '');
       if (customId.indexOf('moveall_') === 0) {
         await handleMoveAllComponent(interaction);
+        return;
+      }
+      if (customId.indexOf('team_') === 0) {
+        await handleTeamComponent(interaction);
+        return;
       }
     }
   } catch (e) {
@@ -2545,118 +2787,22 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // 팀짜기 명령은 지정된 텍스트 채널에서만 허용
     if (!isTeamCommandTextChannel(message)) {
       try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
       return;
     }
 
+    if (!args[0]) {
+      await sendTeamModeMenu(message);
+      return;
+    }
+
     const n = parseInt(args[0], 10);
     if (isNaN(n) || n < 1) {
-      return message.reply('올바른 인원 수를 입력해주세요.');
+      return message.reply('올바른 인원 수를 입력해주세요. 예: `!팀 2` 또는 `!팀`');
     }
 
-    const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel) {
-      return message.reply('음성 채널에 들어가 주세요.');
-    }
-
-    const SPECTATOR_TAG = /\[관전\]/i;
-    const members = Array.from(voiceChannel.members
-      .filter(m => {
-        const name = m.displayName || m.user.username || '';
-        return !m.user.bot && !SPECTATOR_TAG.test(name);
-      })
-      .values());
-
-    if (members.length < n) {
-      return message.reply('음성 채널에 인원이 부족합니다.');
-    }
-
-    // 이전 팀 정보 복사(이전 run과 비교용)
-    const prevTeamsForCompare = (latestTeams && Array.isArray(latestTeams) && latestTeams.length > 0)
-      ? latestTeams
-      : null;
-
-    // 새 팀 구성 시 "이전 팀과의 유사도"를 줄이기 위한 시도
-    const MAX_RETRY = 12;
-    const MAX_SIMILAR_RATIO = 0.4; // 최대 40% 정도만 이전 팀과 비슷하도록 허용
-
-    let bestTeamsMembers = null;
-    let bestRatio = 1.0;
-
-    if (!prevTeamsForCompare) {
-      // 이전 팀이 없으면 그냥 한 번 셔플
-      const shuffledMembers = shuffleArray(members);
-      bestTeamsMembers = buildTeamsFromMembersArray(shuffledMembers, n);
-      bestRatio = 0.0;
-    } else {
-      for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
-        const shuffledMembers = shuffleArray(members);
-        const candidateTeams = buildTeamsFromMembersArray(shuffledMembers, n);
-        const diff = evaluateTeamDifference(prevTeamsForCompare, candidateTeams);
-
-        if (diff.ratio < bestRatio) {
-          bestRatio = diff.ratio;
-          bestTeamsMembers = candidateTeams;
-        }
-
-        if (diff.ratio <= MAX_SIMILAR_RATIO) {
-          break;
-        }
-      }
-
-      if (!bestTeamsMembers) {
-        const shuffledMembers = shuffleArray(members);
-        bestTeamsMembers = buildTeamsFromMembersArray(shuffledMembers, n);
-        bestRatio = 1.0;
-      }
-    }
-
-    const teamsMembers = bestTeamsMembers;
-
-    latestTeams = teamsMembers.map(team => team.map(m => String(m.id)));
-    latestTeamsMeta = {
-      guildId: String(message.guild.id),
-      textChannelId: String(message.channel.id),
-      voiceChannelId: String(voiceChannel.id),
-      createdAtMs: nowMs(),
-    };
-
-    const selectedTeamIndex = Math.floor(Math.random() * teamsMembers.length);
-    const selectedTeamName = (selectedTeamIndex + 1) + ' 팀';
-    const randomMessage = selectedTeamName + '이 좀 치네...?';
-
-    let teamMessage = '**새로운 팀이 구성되었습니다!**\n나와 함께 할 팀은???\n\n';
-    for (let i = 0; i < teamsMembers.length; i++) {
-      const team = teamsMembers[i];
-      teamMessage += '```\nTeam ' + (i + 1) + '\n';
-      for (let j = 0; j < team.length; j++) {
-        teamMessage += String(team[j].displayName) + '\n';
-      }
-      teamMessage += '```\n';
-    }
-
-    teamMessage += '\n' + randomMessage + '\n';
-
-    await sendLongText(message.channel, teamMessage);
-
-    const mentions = members.map(m => '<@' + String(m.id) + '>').join(' ');
-    if (mentions) {
-      const tokens = mentions.split(' ').filter(Boolean);
-      const batchSize = 30;
-      let line = '참가자:';
-      for (let i = 0; i < tokens.length; i++) {
-        if ((i % batchSize) === 0 && i !== 0) {
-          await message.channel.send(line);
-          line = '참가자:';
-        }
-        line += ' ' + tokens[i];
-      }
-      if (line.trim() !== '참가자:') {
-        await message.channel.send(line);
-      }
-    }
+    await executeTeamBuild(message.channel, message.guild, message.member, n, message.author.id);
     return;
   }
 
@@ -2666,7 +2812,6 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // 해산 명령도 지정된 텍스트 채널에서만 허용
     if (!isTeamCommandTextChannel(message)) {
       try { await message.reply('이 명령어는 지정된 채널에서만 사용할 수 있다.'); } catch (e) {}
       return;
@@ -2676,34 +2821,8 @@ client.on(Events.MessageCreate, async (message) => {
       return message.reply('먼저 !팀 명령어로 팀을 구성해주세요.');
     }
 
-    const voiceChannelIds = [
-      '1450857003521015921', '1450857559715217560', '1450857466312261786',
-      '1450857664388005980', '1450857791789989971', '1450857978289983568',
-      '1450858008027336844', '1450858203570110608', '1451547463554170930',
-      '1451547521531773029'
-    ];
-
-    lastDisbandedMemberIds.clear();
-
-    latestTeams.forEach((team, i) => {
-      const channelId = voiceChannelIds[i];
-      const channel = message.guild.channels.cache.get(channelId);
-      if (!channel || !isVoiceChannel(channel)) return;
-
-      for (let j = 0; j < team.length; j++) {
-        const memberId = String(team[j]);
-        const member = message.guild.members.cache.get(memberId);
-        if (member && member.voice && member.voice.channel) {
-          member.voice.setChannel(channel).then(() => {
-            try { lastDisbandedMemberIds.add(String(member.id)); } catch (e) {}
-          }).catch(err => {
-            console.error('이동 실패:', member.displayName, err && err.message ? err.message : err);
-          });
-        }
-      }
-    });
-
-    message.channel.send('모든 인원을 이동 시켰습니다!!! @here');
+    const result = await executeLatestTeamDisband(message.guild);
+    await message.channel.send('팀 해산 완료: ' + result.moved + '명을 각 팀방으로 이동했습니다.');
     return;
   }
 
@@ -2742,7 +2861,7 @@ client.on(Events.MessageCreate, async (message) => {
     message.channel.send(
       '**구인구직 사용방법!**\n음성채널 생성 후 `!놀자` 입력하면 자동으로 초대링크 생성\n\n' +
       '**복귀 사용방법!**\n`!복귀` 입력하면 마지막 `!해산`으로 이동된 인원을 대기실로 이동\n\n' +
-      '**팀 짜기 사용방법!**\n지정된 텍스트 채널에서 내전 대기실 입장 후 `!팀 N` (예: !팀 2 > 2인 팀) 입력 시, 현재 음성채널 인원을 N명씩 팀으로 나눕니다.\n[관전 표시된 인원은 팀 구성에서 제외됩니다]\n해당 봇 저작권은 도비에게 있습니다.'
+      '**팀 짜기 사용방법!**\n지정된 텍스트 채널에서 음성채널 입장 후 `!팀` 입력 시 솔로/듀오/스쿼드 버튼으로 팀을 나눕니다. 기존 방식인 `!팀 N`도 사용할 수 있습니다.\n팀 결과 아래 `예` 버튼을 누르면 각 팀방으로 바로 이동하고, `아니요`를 눌러도 `!해산`으로 나중에 이동할 수 있습니다.\n[관전 표시된 인원은 팀 구성에서 제외됩니다]\n해당 봇 저작권은 도비에게 있습니다.'
     );
     return;
   }
