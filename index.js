@@ -91,6 +91,15 @@ for (let i = 0; i < MANAGED_ROOM_CATEGORIES.length; i++) {
   managedCategoryMap.set(String(MANAGED_ROOM_CATEGORIES[i].categoryId), MANAGED_ROOM_CATEGORIES[i]);
 }
 
+const RECRUIT_MAX_MEMBERS = 4;
+const RECRUIT_INTERVAL_MS = 10 * 60 * 1000;
+const RECRUIT_CREATE_DELAY_MS = 3500;
+const RECRUIT_EVENT_DELAY_MS = 1500;
+const RECRUIT_MIN_REPEAT_GAP_MS = 2 * 60 * 1000;
+const RECRUIT_SPECTATOR_TAG = /\[관전\]/i;
+const recruitLastSentAtByChannelId = new Map();
+const recruitTimersByChannelId = new Map();
+let recruitIntervalStarted = false;
 // ---- 전부이동 상태 관리 ----
 const moveAllStateByUser = new Map(); // userId -> { guildId, sourceChannelId, createdAtMs }
 const MOVEALL_TIMEOUT_MS = 60000;     // 60초 안에 전부이동 선택을 끝내야 유효
@@ -325,7 +334,7 @@ function buildHelpText(isAdmin) {
     '**SVR BOT 도움말**',
     '',
     '**일반 명령어**',
-    '`!놀자` - 현재 음성 채널 기준으로 1시간 초대 링크를 만들고 모집 메시지를 보낸다.',
+    '`!놀자` - 현재 음성 채널 기준으로 모집 임베드를 수동 전송한다. 자동 모집도 함께 작동한다.',
     '`!도움말` 또는 `!명령어` - 봇 명령어 안내를 보여준다.',
     '',
     '**관리자 명령어**',
@@ -1183,6 +1192,107 @@ async function resolveMentionOrIdMembers(message, rawArgs) {
   return result;
 }
 
+function isManagedRecruitVoiceChannel(channel) {
+  if (!isVoiceChannel(channel)) return false;
+  const parentId = getChannelParentId(channel);
+  if (!parentId) return false;
+  return managedCategoryMap.has(String(parentId));
+}
+
+function getEffectiveVoiceMembers(channel) {
+  if (!channel || !channel.members) return [];
+  return Array.from(channel.members.values()).filter((member) => {
+    if (!member || !member.user || member.user.bot) return false;
+    const name = String(member.displayName || member.user.username || '');
+    return !RECRUIT_SPECTATOR_TAG.test(name);
+  });
+}
+
+function getRecruitTheme(channel) {
+  const parentId = getChannelParentId(channel);
+  const cfg = managedCategoryMap.get(String(parentId));
+  const prefixText = cfg && cfg.prefix ? String(cfg.prefix) : '파티방';
+  if (prefixText.indexOf('경쟁') >= 0) return { label: '경쟁방', color: 0xffb020, tone: '치열한 한 판' };
+  if (prefixText.indexOf('빡겜') >= 0) return { label: '빡겜방', color: 0xff4d6d, tone: '집중해서 달릴 스쿼드' };
+  return { label: '일반방', color: 0x35d07f, tone: '편하게 함께할 스쿼드' };
+}
+
+function shouldRecruitChannel(channel) {
+  if (!isManagedRecruitVoiceChannel(channel)) return false;
+  const effectiveMembers = getEffectiveVoiceMembers(channel);
+  return effectiveMembers.length > 0 && effectiveMembers.length < RECRUIT_MAX_MEMBERS;
+}
+
+async function sendRecruitMessage(channel, triggerLabel) {
+  if (!shouldRecruitChannel(channel)) return false;
+
+  const now = nowMs();
+  const lastSentAt = recruitLastSentAtByChannelId.get(String(channel.id)) || 0;
+  if (now - lastSentAt < RECRUIT_MIN_REPEAT_GAP_MS) return false;
+
+  const effectiveMembers = getEffectiveVoiceMembers(channel);
+  const currentMembers = effectiveMembers.length;
+  const remainingMembers = Math.max(RECRUIT_MAX_MEMBERS - currentMembers, 0);
+  if (remainingMembers <= 0) return false;
+
+  const invite = await channel.createInvite({ maxAge: 3600, maxUses: 0, reason: 'auto recruit' });
+  const theme = getRecruitTheme(channel);
+  const memberNames = effectiveMembers.map((member) => String(member.displayName || member.user.username)).join(', ') || '대기 중';
+
+  const embed = new EmbedBuilder()
+    .setColor(theme.color)
+    .setTitle('같이 할 스쿼드 모집 중')
+    .setDescription('**' + String(channel.name || '음성채널') + '** 에서 ' + theme.tone + '를 기다리고 있어요.')
+    .addFields(
+      { name: '모집 현황', value: currentMembers + '/' + RECRUIT_MAX_MEMBERS + '명 참여 중 · **' + remainingMembers + '명 구인 중**', inline: false },
+      { name: '현재 인원', value: memberNames, inline: false },
+      { name: '방 종류', value: theme.label, inline: true },
+      { name: '초대 링크', value: invite.url, inline: false }
+    )
+    .setFooter({ text: '관전 표시는 인원 계산에서 제외됩니다 · 링크는 1시간 후 만료됩니다 · ' + String(triggerLabel || 'auto') })
+    .setTimestamp();
+
+  await channel.send({ content: '@everyone', embeds: [embed], allowedMentions: { parse: ['everyone'] } });
+  recruitLastSentAtByChannelId.set(String(channel.id), now);
+  return true;
+}
+
+function scheduleRecruitCheck(channel, delayMs, triggerLabel) {
+  if (!channel || !channel.id) return;
+  if (!isManagedRecruitVoiceChannel(channel)) return;
+
+  const key = String(channel.id);
+  const oldTimer = recruitTimersByChannelId.get(key);
+  if (oldTimer) {
+    try { clearTimeout(oldTimer); } catch (e) {}
+  }
+
+  const timer = setTimeout(async () => {
+    recruitTimersByChannelId.delete(key);
+    try {
+      await sendRecruitMessage(channel, triggerLabel);
+    } catch (e) {
+      console.error('[RecruitAutoError]', e && e.stack ? e.stack : e);
+    }
+  }, delayMs || RECRUIT_EVENT_DELAY_MS);
+
+  recruitTimersByChannelId.set(key, timer);
+}
+
+async function runPeriodicRecruitCheck() {
+  try {
+    const guilds = Array.from(client.guilds.cache.values());
+    for (let i = 0; i < guilds.length; i++) {
+      const guild = guilds[i];
+      const voices = Array.from(guild.channels.cache.filter((ch) => isManagedRecruitVoiceChannel(ch)).values());
+      for (let j = 0; j < voices.length; j++) {
+        await sendRecruitMessage(voices[j], '10분 자동 확인');
+      }
+    }
+  } catch (e) {
+    console.error('[RecruitPeriodicError]', e && e.stack ? e.stack : e);
+  }
+}
 function getEnvOptional(name) {
   return process.env[name] ? String(process.env[name]) : '';
 }
@@ -1995,6 +2105,11 @@ client.on('ready', async () => {
     console.error('[SlashCommandsRegisterFailed]', e && e.stack ? e.stack : e);
   }
 
+  if (!recruitIntervalStarted) {
+    recruitIntervalStarted = true;
+    setInterval(() => { runPeriodicRecruitCheck(); }, RECRUIT_INTERVAL_MS);
+  }
+
   try {
     await initSheets();
     await ensureFilterDataLoaded();
@@ -2019,6 +2134,7 @@ client.on('channelCreate', (channel) => {
     if (!isManagedCategory(getChannelParentId(channel))) return;
 
     scheduleRenumber(channel.guild.id, getChannelParentId(channel), 'channelCreate');
+    scheduleRecruitCheck(channel, RECRUIT_CREATE_DELAY_MS, '방 생성 자동 모집');
   } catch (e) {
     console.error('[channelCreate handler error]', e && e.stack ? e.stack : e);
   }
@@ -2040,6 +2156,19 @@ client.on('channelDelete', (channel) => {
 
 client.on('voiceStateUpdate', (oldState, newState) => {
   enqueueSheetJobByName('filter', () => handleTrackedVoiceTransition(oldState, newState));
+
+  try {
+    const oldChannel = oldState ? oldState.channel : null;
+    const newChannel = newState ? newState.channel : null;
+    if (oldChannel && isManagedRecruitVoiceChannel(oldChannel)) {
+      scheduleRecruitCheck(oldChannel, RECRUIT_EVENT_DELAY_MS, '인원 변경 자동 모집');
+    }
+    if (newChannel && isManagedRecruitVoiceChannel(newChannel) && (!oldChannel || String(oldChannel.id) !== String(newChannel.id))) {
+      scheduleRecruitCheck(newChannel, RECRUIT_EVENT_DELAY_MS, '인원 변경 자동 모집');
+    }
+  } catch (e) {
+    console.error('[RecruitVoiceStateError]', e && e.stack ? e.stack : e);
+  }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -2534,36 +2663,28 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   if (command === '놀자') {
-    const maxMembers = 4;
+    const voice = message.member && message.member.voice ? message.member.voice.channel : null;
 
-    if (!message.member.voice.channel) {
+    if (!isVoiceChannel(voice)) {
       return message.reply('먼저 음성 채널에 들어가주세요!');
     }
 
-    const voice = message.member.voice.channel;
-
-    const SPECTATOR_TAG = /\[관전\]/i;
-    const effectiveMembers = voice.members.filter(m => {
-      const name = m.displayName || m.user.username || '';
-      return !m.user.bot && !SPECTATOR_TAG.test(name);
-    });
-
-    const currentMembers = effectiveMembers.size;
-    const remainingMembers = Math.max(maxMembers - currentMembers, 0);
-
-    const invite = await voice.createInvite({ maxAge: 3600 });
-
-    const colors = ['#FF5733', '#C70039', '#900C3F', '#581845', '#2E86C1', '#2ECC71', '#F1C40F', '#8E44AD'];
-    const selectedColor = colors[Math.floor(Math.random() * colors.length)];
-
-    const inviteMessage = new EmbedBuilder()
-      .setTitle(voice.name + '\n' + remainingMembers + ' 명 구인 구직 중이에요')
-      .setColor(selectedColor)
-      .setFooter({ text: '해당링크는 1시간 후 자동으로 소멸됩니다.' })
-      .setTimestamp();
-
-    message.channel.send({ embeds: [inviteMessage] });
-    message.channel.send(invite.url + '\n@here');
+    try {
+      const sent = await sendRecruitMessage(voice, '수동 모집');
+      if (!sent) {
+        const effectiveMembers = getEffectiveVoiceMembers(voice);
+        if (effectiveMembers.length >= RECRUIT_MAX_MEMBERS) {
+          await message.reply('현재 관전자 제외 4명이 모두 차 있어서 구인구직을 보내지 않았습니다.');
+        } else if (!isManagedRecruitVoiceChannel(voice)) {
+          await message.reply('일반방/경쟁방/빡겜방 카테고리의 음성 채널에서만 구인구직을 보낼 수 있습니다.');
+        } else {
+          await message.reply('최근에 이미 구인구직을 보냈습니다. 잠시 후 다시 시도해주세요.');
+        }
+      }
+    } catch (e) {
+      console.error('[RecruitManualError]', e && e.stack ? e.stack : e);
+      await message.reply('구인구직 메시지 생성 중 오류가 발생했습니다. Heroku 로그를 확인해주세요.');
+    }
     return;
   }
 
