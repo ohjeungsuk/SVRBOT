@@ -385,6 +385,19 @@ function buildTeamDisbandConfirmComponents(userId) {
   )];
 }
 
+function buildTeamReturnConfirmComponents(userId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(['team_return_yes', userId].join(':'))
+      .setLabel('예, 대기실로 복귀')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(['team_return_no', userId].join(':'))
+      .setLabel('아니요')
+      .setStyle(ButtonStyle.Secondary)
+  )];
+}
+
 function buildTeamResultEmbed(teamsMembers, teamSize, voiceChannel, actorMember) {
   const modeLabel = getTeamModeLabel(teamSize);
   const totalMembers = teamsMembers.reduce((sum, team) => sum + team.length, 0);
@@ -493,6 +506,30 @@ async function executeLatestTeamDisband(guild) {
   return { moved: moved, reason: '' };
 }
 
+async function executeLatestTeamReturn(guild) {
+  if (!guild) return { moved: 0, reason: 'noGuild' };
+  const waiting = guild.channels.cache.get(WAITING_ROOM_VOICE_ID);
+  if (!waiting || !isVoiceChannel(waiting)) return { moved: 0, reason: 'missingWaitingRoom' };
+  if (lastDisbandedMemberIds.size === 0) return { moved: 0, reason: 'noTargets' };
+
+  let moved = 0;
+  const ids = Array.from(lastDisbandedMemberIds);
+  for (let i = 0; i < ids.length; i++) {
+    const id = String(ids[i]);
+    const mem = guild.members.cache.get(id);
+    if (!mem || !mem.voice || !mem.voice.channel) continue;
+    try {
+      await mem.voice.setChannel(waiting);
+      moved++;
+    } catch (e) {
+      console.error('[Return] move failed:', id, e && e.message ? e.message : e);
+    }
+  }
+
+  lastDisbandedMemberIds.clear();
+  return { moved: moved, reason: '' };
+}
+
 async function handleTeamComponent(interaction) {
   const parts = String(interaction.customId || '').split(':');
   const action = parts[0];
@@ -530,12 +567,37 @@ async function handleTeamComponent(interaction) {
       await interaction.followUp({ content: '먼저 !팀 명령어로 팀을 구성해주세요.', ephemeral: true });
       return;
     }
-    await interaction.followUp({ content: '팀 해산 완료: ' + result.moved + '명을 각 팀방으로 이동했습니다.', ephemeral: true });
+    await interaction.followUp({
+      content: '팀 해산 완료: ' + result.moved + '명을 각 팀방으로 이동했습니다.\n복귀하시겠습니까?',
+      components: buildTeamReturnConfirmComponents(interaction.user.id),
+      ephemeral: true,
+    });
     return;
   }
 
   if (action === 'team_disband_no') {
     await interaction.update({ content: '팀방 이동은 취소했습니다. 마지막 팀 결과는 유지되므로 `!해산`으로 나중에 이동할 수 있습니다.', embeds: interaction.message.embeds, components: [] });
+    return;
+  }
+
+  if (action === 'team_return_yes') {
+    await interaction.update({ content: '대기실 복귀를 시작합니다.', components: [] });
+    const result = await executeLatestTeamReturn(interaction.guild);
+    if (result.reason === 'missingWaitingRoom') {
+      await interaction.followUp({ content: '복귀 실패: 대기실 음성채널을 찾지 못했습니다.', ephemeral: true });
+      return;
+    }
+    if (result.reason === 'noTargets') {
+      await interaction.followUp({ content: '복귀할 대상이 없습니다.', ephemeral: true });
+      return;
+    }
+    await interaction.followUp({ content: '복귀 완료: ' + result.moved + '명을 대기실로 이동했습니다.', ephemeral: true });
+    return;
+  }
+
+  if (action === 'team_return_no') {
+    await interaction.update({ content: '복귀를 취소했습니다. 필요하면 `!복귀`로 나중에 복귀시킬 수 있습니다.', components: [] });
+    return;
   }
 }
 
@@ -2740,7 +2802,7 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
-  // !복귀: 마지막 !해산으로 이동된 인원들을 대기실로 이동
+  // !복귀: 마지막 !해산 또는 버튼 해산으로 이동된 인원들을 대기실로 이동
   if (command === '복귀') {
     if (!isAdminMember(message.member)) {
       try { await message.reply('권한이 없다.'); } catch (e) {}
@@ -2749,35 +2811,17 @@ client.on(Events.MessageCreate, async (message) => {
 
     if (!message.guild) return;
 
-    const waiting = message.guild.channels.cache.get(WAITING_ROOM_VOICE_ID);
-    if (!waiting || !isVoiceChannel(waiting)) {
-      try { await message.reply('복귀 실패: 대기실 음성채널을 못 찾음.'); } catch (e) {}
+    const result = await executeLatestTeamReturn(message.guild);
+    if (result.reason === 'missingWaitingRoom') {
+      try { await message.reply('복귀 실패: 대기실 음성채널을 찾지 못했습니다.'); } catch (e) {}
       return;
     }
-
-    if (lastDisbandedMemberIds.size === 0) {
+    if (result.reason === 'noTargets') {
       try { await message.reply('복귀할 대상이 없다.'); } catch (e) {}
       return;
     }
 
-    let moved = 0;
-    const ids = Array.from(lastDisbandedMemberIds);
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
-      const mem = message.guild.members.cache.get(String(id));
-      if (!mem) continue;
-      if (!mem.voice || !mem.voice.channel) continue;
-
-      try {
-        await mem.voice.setChannel(waiting);
-        moved++;
-      } catch (e) {
-        console.error('[Return] move failed:', id, e && e.message ? e.message : e);
-      }
-    }
-
-    lastDisbandedMemberIds.clear();
-    try { await message.reply('복귀 완료: ' + moved + '명 대기실 이동'); } catch (e) {}
+    try { await message.reply('복귀 완료: ' + result.moved + '명 대기실 이동'); } catch (e) {}
     return;
   }
 
