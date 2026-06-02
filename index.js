@@ -64,6 +64,8 @@ const FILTER_CHAT_CHANNEL_IDS = [
 ];
 const FILTER_RECRUIT_CHANNEL_IDS = [
   '1456630730435068138',
+  '1439263507089457313',
+  '1453258034988974191',
 ];
 const FILTER_VOICE_CATEGORY_IDS = [
   '1453251021282476084',
@@ -97,6 +99,11 @@ const RECRUIT_CREATE_DELAY_MS = 3500;
 const RECRUIT_EVENT_DELAY_MS = 1500;
 const RECRUIT_MIN_REPEAT_GAP_MS = 2 * 60 * 1000;
 const RECRUIT_SPECTATOR_TAG = /\[관전\]/i;
+const RECRUIT_TEXT_CHANNEL_BY_CATEGORY_ID = {
+  '1453251021282476084': '1456630730435068138',
+  '1453251462586171446': '1439263507089457313',
+  '1453257882438205531': '1453258034988974191',
+};
 const recruitLastSentAtByChannelId = new Map();
 const recruitTimersByChannelId = new Map();
 let recruitIntervalStarted = false;
@@ -1209,18 +1216,39 @@ function getEffectiveVoiceMembers(channel) {
 }
 
 function getRecruitTheme(channel) {
-  const parentId = getChannelParentId(channel);
-  const cfg = managedCategoryMap.get(String(parentId));
-  const prefixText = cfg && cfg.prefix ? String(cfg.prefix) : '파티방';
-  if (prefixText.indexOf('경쟁') >= 0) return { label: '경쟁방', color: 0xffb020, tone: '치열한 한 판' };
-  if (prefixText.indexOf('빡겜') >= 0) return { label: '빡겜방', color: 0xff4d6d, tone: '집중해서 달릴 스쿼드' };
-  return { label: '일반방', color: 0x35d07f, tone: '편하게 함께할 스쿼드' };
+  const parentId = String(getChannelParentId(channel) || '');
+  if (parentId === '1453251462586171446') return { label: '경쟁방', color: 0xffb020, tone: '치열한 한 판' };
+  if (parentId === '1453257882438205531') return { label: '빡겜방', color: 0xff4d6d, tone: '집중해서 달릴 스쿼드' };
+  return { label: '일반방', color: 0x35d07f, tone: '편하게 즐길 스쿼드' };
 }
 
 function shouldRecruitChannel(channel) {
   if (!isManagedRecruitVoiceChannel(channel)) return false;
   const effectiveMembers = getEffectiveVoiceMembers(channel);
   return effectiveMembers.length > 0 && effectiveMembers.length < RECRUIT_MAX_MEMBERS;
+}
+
+function getRecruitTextChannelIdForVoice(channel) {
+  const parentId = String(getChannelParentId(channel) || '');
+  return RECRUIT_TEXT_CHANNEL_BY_CATEGORY_ID[parentId] || '';
+}
+
+async function getRecruitTextChannelForVoice(channel) {
+  const guild = channel && channel.guild ? channel.guild : null;
+  const textChannelId = getRecruitTextChannelIdForVoice(channel);
+  if (!guild || !textChannelId) return null;
+
+  let textChannel = guild.channels.cache.get(String(textChannelId));
+  if (!textChannel) {
+    try {
+      textChannel = await guild.channels.fetch(String(textChannelId));
+    } catch (e) {
+      textChannel = null;
+    }
+  }
+
+  if (!textChannel || typeof textChannel.send !== 'function') return null;
+  return textChannel;
 }
 
 async function sendRecruitMessage(channel, triggerLabel) {
@@ -1236,6 +1264,11 @@ async function sendRecruitMessage(channel, triggerLabel) {
   if (remainingMembers <= 0) return false;
 
   const invite = await channel.createInvite({ maxAge: 3600, maxUses: 0, reason: 'auto recruit' });
+  const recruitTextChannel = await getRecruitTextChannelForVoice(channel);
+  if (!recruitTextChannel) {
+    console.error('[RecruitChannelMissing] voiceChannelId=' + String(channel.id) + ', parentId=' + String(getChannelParentId(channel) || ''));
+    return false;
+  }
   const theme = getRecruitTheme(channel);
   const memberNames = effectiveMembers.map((member) => String(member.displayName || member.user.username)).join(', ') || '대기 중';
 
@@ -1252,7 +1285,7 @@ async function sendRecruitMessage(channel, triggerLabel) {
     .setFooter({ text: '관전 표시는 인원 계산에서 제외됩니다 · 링크는 1시간 후 만료됩니다 · ' + String(triggerLabel || 'auto') })
     .setTimestamp();
 
-  await channel.send({ content: '@everyone', embeds: [embed], allowedMentions: { parse: ['everyone'] } });
+  await recruitTextChannel.send({ content: '@everyone', embeds: [embed], allowedMentions: { parse: ['everyone'] } });
   recruitLastSentAtByChannelId.set(String(channel.id), now);
   return true;
 }
