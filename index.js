@@ -46,7 +46,8 @@ const FILTER_VOICE_CATEGORY_IDS = [
 ];
 const FILTER_VOICE_MINUTES_REQUIRED = 10;
 const FILTER_DEFAULT_PERIOD_MINUTES = 1;
-const FILTER_AUTO_CHECK_INTERVAL_MS = 10000;
+const FILTER_AUTO_CHECK_INTERVAL_MS = 60000;
+const FILTER_CONFIG_RELOAD_INTERVAL_MS = 60000;
 const FILTER_CONFIG_SHEET_TITLE = '활동필터설정';
 const FILTER_STATE_SHEET_TITLE = '활동필터상태';
 const FILTER_LOG_SHEET_TITLE = '활동필터로그';
@@ -84,6 +85,8 @@ let filterConfig = {
 };
 const filterStateByUserId = new Map();
 let filterAutoCheckTimerStarted = false;
+let lastFilterConfigReloadAtMs = 0;
+let lastAutoFilterCheckAtKST = '';
 
 const FILTER_STATE_COLUMNS = [
   'userId',
@@ -238,13 +241,24 @@ function evaluateTeamDifference(prevTeams, newTeamsMembers) {
   return { ratio: ratio };
 }
 
-// sheet job serialize
-let sheetQueue = Promise.resolve();
-function enqueueSheetJob(fn) {
-  sheetQueue = sheetQueue.then(fn).catch((err) => {
-    console.error('[SheetJobError]', err && err.stack ? err.stack : err);
+// 시트 작업은 기능별 큐로 나눠서 오래 걸리는 작업이 다른 기능을 막지 않게 한다.
+const sheetQueues = {
+  default: Promise.resolve(),
+  leave: Promise.resolve(),
+  filter: Promise.resolve(),
+  backup: Promise.resolve(),
+};
+
+function enqueueSheetJobByName(queueName, fn) {
+  const name = sheetQueues[queueName] ? queueName : 'default';
+  sheetQueues[name] = sheetQueues[name].then(fn).catch((err) => {
+    console.error('[SheetJobError][' + name + ']', err && err.stack ? err.stack : err);
   });
-  return sheetQueue;
+  return sheetQueues[name];
+}
+
+function enqueueSheetJob(fn) {
+  return enqueueSheetJobByName('default', fn);
 }
 
 
@@ -261,6 +275,39 @@ function safeShort(str, maxLen) {
   return s.slice(0, maxLen) + '...';
 }
 
+function buildHelpText(isAdmin) {
+  const lines = [
+    '**SVR BOT 도움말**',
+    '',
+    '**일반 명령어**',
+    '`!놀자` - 현재 음성 채널 기준으로 1시간 초대 링크를 만들고 모집 메시지를 보낸다.',
+    '`!도움말` 또는 `!명령어` - 봇 명령어 안내를 보여준다.',
+    '',
+    '**관리자 명령어**',
+    '`!팀 인원수` - 현재 음성 채널 인원을 지정한 인원수 단위로 랜덤 팀 편성한다. `[관전]` 표시는 제외된다.',
+    '`!해산` - 마지막으로 만든 팀을 지정된 팀 음성방으로 이동한다.',
+    '`!복귀` - 마지막 `!해산`으로 이동된 인원을 대기실로 이동한다.',
+    '`!전부이동` - 현재 음성 채널의 모든 인원을 선택한 음성 채널로 이동한다.',
+    '`!백업` - 외출 신청 채널의 양식 메시지를 새 구글 시트 탭으로 백업한다.',
+    '',
+    '**활동 필터 관리자 명령어**',
+    '`!기간 분` - 활동 필터 검사 기간을 분 단위로 설정한다. 예: `!기간 60`',
+    '`!테스트 @유저` - 활동 필터 대상자를 지정한다. 여러 명 멘션 또는 유저 ID 입력 가능.',
+    '`!테스트목록` - 현재 필터 대상자와 통과/대기 상태를 확인한다.',
+    '`!테스트삭제` - 현재 필터 대상자와 관련 상태 기록을 삭제한다.',
+    '`!필터` - 현재 대상자를 즉시 검사하고 조건 미충족 대상자를 처리한다.',
+    '',
+    '**자동 기능**',
+    '외출 양식 메시지는 구글 시트에 자동 기록되고, 수정된 메시지는 캐시된 행에 반영된다.',
+    '지정된 음성방 카테고리에서는 방 생성/삭제 후 번호가 자동 정렬된다.',
+  ];
+
+  if (!isAdmin) {
+    lines.splice(5, 18, '**관리자 명령어**', '관리자 전용 명령어는 권한이 있는 멤버만 사용할 수 있다.');
+  }
+
+  return lines.join('\n');
+}
 async function sendLongText(channel, text) {
   if (!channel || !text) return;
 
@@ -1020,9 +1067,14 @@ async function runFilterForTestTargets(message) {
 async function runAutomaticFilterCheck() {
   try {
     await initSheets();
-    await loadFilterConfigFromSheet();
-    await loadFilterStateFromSheet();
-    filterDataReady = true;
+    const currentMs = nowMs();
+    if (!filterDataReady || currentMs - lastFilterConfigReloadAtMs >= FILTER_CONFIG_RELOAD_INTERVAL_MS) {
+      await loadFilterConfigFromSheet();
+      await loadFilterStateFromSheet();
+      filterDataReady = true;
+      lastFilterConfigReloadAtMs = currentMs;
+    }
+    lastAutoFilterCheckAtKST = formatKSTFromDate(new Date());
 
     if (!isFilterPeriodReady()) return;
     if (!filterConfig.testTargetIds || filterConfig.testTargetIds.length === 0) return;
@@ -1201,7 +1253,7 @@ async function appendLeaveRow(message) {
 
   const parsed = parseLeaveForm(message.content);
   if (!parsed) {
-    console.log('[Leave][Skip] format not matched', 'mid=' + message.id, 'content=' + safeShort(message.content, 120));
+    console.log('[Leave][Skip] format not matched', 'mid=' + message.id, 'content_length=' + String(message.content ? message.content.length : 0));
     return;
   }
 
@@ -1210,7 +1262,7 @@ async function appendLeaveRow(message) {
 
   const range = a1Range(SHEET_TITLE, 'A:D');
 
-  console.log('[Leave][Append] try', 'mid=' + message.id, 'nick=' + safeShort(parsed.nickname, 30), 'time(KST)=' + registeredAtKST);
+  console.log('[Leave][Append] try', 'mid=' + message.id, 'time(KST)=' + registeredAtKST);
 
   const res = await sheetsApi.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
@@ -1323,12 +1375,13 @@ async function appendRowsToSheet(sheetTitle, rows, a1) {
   });
 }
 
-async function fetchAllMessagesFromChannelText(channel) {
-  const all = [];
+async function fetchLeaveRowsFromChannelText(channel) {
+  const matchedRows = [];
   let lastId = null;
+  let fetchedCount = 0;
 
-  while (all.length < BACKUP_MAX_MESSAGES) {
-    const opt = { limit: 100 };
+  while (fetchedCount < BACKUP_MAX_MESSAGES) {
+    const opt = { limit: Math.min(100, BACKUP_MAX_MESSAGES - fetchedCount) };
     if (lastId) opt.before = lastId;
 
     let batch;
@@ -1342,16 +1395,28 @@ async function fetchAllMessagesFromChannelText(channel) {
     if (!batch || batch.size === 0) break;
 
     const arr = batch.array();
-    for (let i = 0; i < arr.length; i++) all.push(arr[i]);
+    fetchedCount += arr.length;
+
+    for (let i = 0; i < arr.length; i++) {
+      const msg = arr[i];
+      const parsed = parseLeaveForm(msg.content);
+      if (!parsed) continue;
+
+      matchedRows.push({
+        createdTimestamp: msg.createdTimestamp || 0,
+        row: [parsed.nickname, parsed.reason, parsed.period],
+      });
+    }
 
     lastId = arr[arr.length - 1].id;
 
-    if (all.length % 500 === 0) {
-      console.log('[Backup] fetched messages:', all.length);
+    if (fetchedCount % 500 === 0) {
+      console.log('[Backup] fetched messages:', fetchedCount, 'matched=' + matchedRows.length);
     }
   }
 
-  return all;
+  matchedRows.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+  return matchedRows.map((item) => item.row);
 }
 
 async function runBackup(invokingMessage) {
@@ -1404,37 +1469,14 @@ async function runBackup(invokingMessage) {
 
     console.log('[Backup] fetching messages from channel:', TARGET_CHANNEL_ID);
 
-    const msgs = await fetchAllMessagesFromChannelText(ch);
-    if (!msgs || msgs.length === 0) {
-      await notify('백업 완료(0건). 새 시트: ' + newTitle);
-      return;
-    }
-
-    msgs.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    console.log('[Backup] total messages fetched:', msgs.length);
-
-    const rows = [];
-    let matched = 0;
-
-    for (let i = 0; i < msgs.length; i++) {
-      const m = msgs[i];
-      const parsed = parseLeaveForm(m.content);
-      if (!parsed) continue;
-
-      matched++;
-      rows.push([parsed.nickname, parsed.reason, parsed.period]);
-
-      if (matched % 500 === 0) {
-        console.log('[Backup] matched rows:', matched);
-      }
-    }
-
-    if (rows.length === 0) {
+    const rows = await fetchLeaveRowsFromChannelText(ch);
+    if (!rows || rows.length === 0) {
       console.log('[Backup] no matched leave-form messages');
       await notify('백업 완료(양식 0건). 새 시트: ' + newTitle);
       return;
     }
 
+    console.log('[Backup] matched rows:', rows.length);
     const CHUNK = 500;
     for (let s = 0; s < rows.length; s += CHUNK) {
       const chunk = rows.slice(s, s + CHUNK);
@@ -1576,9 +1618,7 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 process.on('unhandledRejection', (err) => {
-  console.error('[FATAL][unhandledRejection]', err && err.stack ? err.stack : err);
-  try { if (client && client.destroy) client.destroy(); } catch (e) {}
-  process.exit(1);
+  console.error('[UnhandledRejection]', err && err.stack ? err.stack : err);
 });
 
 function gracefulShutdown(sig) {
@@ -1613,7 +1653,7 @@ client.on('ready', async () => {
     if (!filterAutoCheckTimerStarted) {
       filterAutoCheckTimerStarted = true;
       setInterval(() => {
-        enqueueSheetJob(() => runAutomaticFilterCheck());
+        enqueueSheetJobByName('filter', () => runAutomaticFilterCheck());
       }, FILTER_AUTO_CHECK_INTERVAL_MS);
     }
   } catch (e) {
@@ -1651,7 +1691,7 @@ client.on('channelDelete', (channel) => {
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {
-  enqueueSheetJob(() => handleTrackedVoiceTransition(oldState, newState));
+  enqueueSheetJobByName('filter', () => handleTrackedVoiceTransition(oldState, newState));
 });
 
 // 메시지 작성 시
@@ -1742,16 +1782,16 @@ client.on('message', async (message) => {
       'cid=' + message.channel.id,
       'mid=' + message.id,
       'created(KST)=' + formatKSTFromDate(message.createdAt),
-      'content=' + safeShort(message.content, 140)
+      'content_length=' + String(message.content ? message.content.length : 0)
     );
-    enqueueSheetJob(() => appendLeaveRow(message));
+    enqueueSheetJobByName('leave', () => appendLeaveRow(message));
   }
 
   try {
     if (isFilterTrackedTextChannel(message, filterTrackedChatChannelIds)) {
-      enqueueSheetJob(() => updateFilterActivityForMessage(message, 'chat'));
+      enqueueSheetJobByName('filter', () => updateFilterActivityForMessage(message, 'chat'));
     } else if (isFilterTrackedTextChannel(message, filterTrackedRecruitChannelIds)) {
-      enqueueSheetJob(() => updateFilterActivityForMessage(message, 'recruit'));
+      enqueueSheetJobByName('filter', () => updateFilterActivityForMessage(message, 'recruit'));
     }
   } catch (e) {
     console.error('[FilterMessageTrackError]', e && e.stack ? e.stack : e);
@@ -1761,6 +1801,11 @@ client.on('message', async (message) => {
 
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
+
+  if (command === '도움말' || command === '명령어') {
+    try { await sendLongText(message.channel, buildHelpText(isAdminMember(message.member))); } catch (e) {}
+    return;
+  }
 
   const isFilterCommand = (
     command === '기간' ||
@@ -1776,8 +1821,13 @@ client.on('message', async (message) => {
   }
 
   if (command === '백업') {
+    if (!isAdminMember(message.member)) {
+      try { await message.reply('권한이 없다.'); } catch (e) {}
+      return;
+    }
+
     console.log('[Backup] command received by', message.author.tag);
-    runBackup(message);
+    enqueueSheetJobByName('backup', () => runBackup(message));
     return;
   }
 
@@ -1793,7 +1843,7 @@ client.on('message', async (message) => {
       return;
     }
 
-    await enqueueSheetJob(() => setFilterPeriodMinutes(minutes, message.guild ? message.guild.id : ''));
+    await enqueueSheetJobByName('filter', () => setFilterPeriodMinutes(minutes, message.guild ? message.guild.id : ''));
     try { await message.reply('필터 기간을 ' + String(minutes) + '분으로 설정했다. 이제 !테스트 @유저 형식으로 대상자를 지정해라.'); } catch (e) {}
     return;
   }
@@ -1816,7 +1866,7 @@ client.on('message', async (message) => {
       return;
     }
 
-    await enqueueSheetJob(() => setTestTargetsFromMembers(members, message.guild ? message.guild.id : ''));
+    await enqueueSheetJobByName('filter', () => setTestTargetsFromMembers(members, message.guild ? message.guild.id : ''));
     try { await message.reply('테스트 대상자 설정 완료: ' + members.map((m) => String(m.displayName)).join(', ')); } catch (e) {}
     return;
   }
@@ -1833,7 +1883,7 @@ client.on('message', async (message) => {
       return;
     }
 
-    await enqueueSheetJob(() => clearTestTargets());
+    await enqueueSheetJobByName('filter', () => clearTestTargets());
     try { await message.reply('현재 테스트 대상자 설정을 전부 삭제했다.'); } catch (e) {}
     return;
   }
@@ -1886,7 +1936,7 @@ client.on('message', async (message) => {
       return;
     }
 
-    await enqueueSheetJob(() => runFilterForTestTargets(message));
+    await enqueueSheetJobByName('filter', () => runFilterForTestTargets(message));
     return;
   }
 
@@ -2179,8 +2229,8 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     if (!newMessage.author || newMessage.author.bot) return;
     if (!isTargetChannelOrThread(newMessage)) return;
 
-    console.log('[MSG_EDIT] recv', 'mid=' + newMessage.id, 'content=' + safeShort(newMessage.content, 140));
-    enqueueSheetJob(() => updateLeaveRowFromEdit(newMessage));
+    console.log('[MSG_EDIT] recv', 'mid=' + newMessage.id, 'content_length=' + String(newMessage.content ? newMessage.content.length : 0));
+    enqueueSheetJobByName('leave', () => updateLeaveRowFromEdit(newMessage));
   } catch (e) {
     console.error('[messageUpdate handler error]', e && e.stack ? e.stack : e);
   }
