@@ -1990,6 +1990,12 @@ client.on('ready', async () => {
   console.log('[Env] GOOGLE_SA_JSON_B64:', process.env.GOOGLE_SA_JSON_B64 ? 'SET' : 'MISSING');
 
   try {
+    await registerSlashCommands();
+  } catch (e) {
+    console.error('[SlashCommandsRegisterFailed]', e && e.stack ? e.stack : e);
+  }
+
+  try {
     await initSheets();
     await ensureFilterDataLoaded();
     if (!filterAutoCheckTimerStarted) {
