@@ -1,4 +1,4 @@
-// index.js (discord.js v12.5.3 + Google Sheets logger + !복귀 + PartyBeast room renumber )
+// index.js (discord.js v14 + Google Sheets logger + slash command move-all + PartyBeast room renumber)
 // Required Heroku Config Vars:
 // - DISCORD_TOKEN
 // - GOOGLE_SA_JSON_B64
@@ -6,10 +6,34 @@
 //
 // Recommended Heroku dynos: worker=1, web=0
 
-const Discord = require('discord.js');
+const {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ChannelType,
+  Client,
+  EmbedBuilder,
+  Events,
+  GatewayIntentBits,
+  Partials,
+  PermissionsBitField,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  StringSelectMenuBuilder,
+} = require('discord.js');
 const { google } = require('googleapis');
-const client = new Discord.Client({
-  partials: ['MESSAGE', 'CHANNEL', 'REACTION'],
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessageReactions,
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
 const prefix = '!';
@@ -115,8 +139,8 @@ function nowMs() {
 }
 
 function isAdminMember(member) {
-  if (!member || !member.hasPermission) return false;
-  try { return member.hasPermission('ADMINISTRATOR'); } catch (e) { return false; }
+  if (!member || !member.permissions) return false;
+  try { return member.permissions.has(PermissionsBitField.Flags.Administrator); } catch (e) { return false; }
 }
 
 function isTeamCommandTextChannel(message) {
@@ -348,7 +372,7 @@ function isFilterTrackedTextChannel(message, channelIdSet) {
   const cid = String(message.channel.id);
   if (channelIdSet.has(cid)) return true;
 
-  if (message.channel.parentID && channelIdSet.has(String(message.channel.parentID))) {
+  if (getChannelParentId(message.channel) && channelIdSet.has(String(getChannelParentId(message.channel)))) {
     return true;
   }
 
@@ -357,9 +381,9 @@ function isFilterTrackedTextChannel(message, channelIdSet) {
 
 function isTrackedVoiceChannel(channel) {
   if (!channel) return false;
-  if (channel.type !== 'voice') return false;
-  if (!channel.parentID) return false;
-  if (!filterTrackedVoiceCategoryIds.has(String(channel.parentID))) return false;
+  if (!isVoiceChannel(channel)) return false;
+  if (!getChannelParentId(channel)) return false;
+  if (!filterTrackedVoiceCategoryIds.has(String(getChannelParentId(channel)))) return false;
   if (String(channel.name || '').indexOf('[관전]') >= 0) return false;
   return true;
 }
@@ -1138,6 +1162,303 @@ async function resolveMentionOrIdMembers(message, rawArgs) {
   return result;
 }
 
+function getEnvOptional(name) {
+  return process.env[name] ? String(process.env[name]) : '';
+}
+
+async function registerSlashCommands() {
+  const token = getEnvOptional('DISCORD_TOKEN');
+  const clientId = getEnvOptional('CLIENT_ID');
+  const guildId = getEnvOptional('GUILD_ID');
+
+  if (!token || !clientId || !guildId) {
+    console.log('[SlashCommands] skipped: CLIENT_ID or GUILD_ID is missing');
+    return;
+  }
+
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('전부이동')
+      .setDescription('현재 음성 채널 인원을 선택한 음성 채널 또는 새 파티방으로 이동합니다.')
+      .toJSON(),
+  ];
+
+  const rest = new REST({ version: '10' }).setToken(token);
+  await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
+  console.log('[SlashCommands] registered guild commands:', guildId);
+}
+
+function getDisplayNameForLog(member) {
+  if (!member) return '알 수 없음';
+  return String(member.displayName || (member.user && member.user.username) || member.id || '알 수 없음');
+}
+
+function shortSelectLabel(text) {
+  const src = String(text || '').trim();
+  if (src.length <= 90) return src;
+  return src.slice(0, 87) + '...';
+}
+
+function buildMoveAllOptions(guild, sourceChannel) {
+  const options = [];
+  const partyCreateIds = new Set(MOVEALL_PARTY_CREATE_OPTIONS.map((item) => String(item.channelId)));
+
+  for (let i = 0; i < MOVEALL_PARTY_CREATE_OPTIONS.length; i++) {
+    const cfg = MOVEALL_PARTY_CREATE_OPTIONS[i];
+    const ch = guild.channels.cache.get(String(cfg.channelId));
+    if (!isVoiceChannel(ch)) continue;
+    options.push({ type: 'partyCreate', label: cfg.label, channelId: String(cfg.channelId), channelName: String(ch.name || cfg.label) });
+  }
+
+  const voices = Array.from(guild.channels.cache
+    .filter((ch) => ch && isVoiceChannel(ch) && String(ch.id) !== String(sourceChannel.id))
+    .values())
+    .sort((a, b) => {
+      const pa = typeof a.rawPosition === 'number' ? a.rawPosition : (a.position || 0);
+      const pb = typeof b.rawPosition === 'number' ? b.rawPosition : (b.position || 0);
+      if (pa !== pb) return pa - pb;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+
+  for (let i = 0; i < voices.length; i++) {
+    const ch = voices[i];
+    if (partyCreateIds.has(String(ch.id))) continue;
+    options.push({ type: 'existing', label: String(ch.name || ch.id), channelId: String(ch.id), channelName: String(ch.name || ch.id) });
+  }
+
+  return options;
+}
+
+function buildMoveAllComponents(options, pageIndex, userId, sourceChannelId) {
+  const totalPages = Math.max(1, Math.ceil(options.length / MOVEALL_SELECT_PAGE_SIZE));
+  const start = pageIndex * MOVEALL_SELECT_PAGE_SIZE;
+  const pageOptions = options.slice(start, start + MOVEALL_SELECT_PAGE_SIZE);
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(['moveall_select', userId, sourceChannelId, String(pageIndex)].join(':'))
+    .setPlaceholder('이동할 음성 채널을 선택하세요')
+    .addOptions(pageOptions.map((option, index) => ({
+      label: shortSelectLabel(option.label),
+      description: option.type === 'partyCreate' ? '파티방을 새로 만들고 이동합니다.' : '기존 음성 채널로 이동합니다.',
+      value: String(start + index),
+    })));
+
+  const rows = [new ActionRowBuilder().addComponents(select)];
+  const buttons = [];
+
+  if (totalPages > 1) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(['moveall_page', userId, sourceChannelId, String(pageIndex <= 0 ? totalPages - 1 : pageIndex - 1)].join(':'))
+        .setLabel('이전')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(['moveall_page', userId, sourceChannelId, String(pageIndex >= totalPages - 1 ? 0 : pageIndex + 1)].join(':'))
+        .setLabel('다음')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+
+  buttons.push(
+    new ButtonBuilder()
+      .setCustomId(['moveall_cancel', userId, sourceChannelId, String(pageIndex)].join(':'))
+      .setLabel('취소')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  rows.push(new ActionRowBuilder().addComponents(buttons));
+  return rows;
+}
+
+function buildMoveAllContent(sourceChannel, pageIndex, options) {
+  const totalPages = Math.max(1, Math.ceil(options.length / MOVEALL_SELECT_PAGE_SIZE));
+  return [
+    '**전부이동 대상 선택**',
+    '현재 방: ' + String(sourceChannel.name || sourceChannel.id),
+    '목록에서 이동할 음성 채널을 선택하세요. 이 선택 메뉴는 명령어 사용자에게만 보입니다.',
+    '파티 생성 항목을 선택하면 새 파티방 생성 후 인원을 이동합니다.',
+    '페이지: ' + String(pageIndex + 1) + '/' + String(totalPages),
+  ].join('\n');
+}
+
+async function replyMoveAllMenu(interaction, pageIndex) {
+  const member = interaction.member;
+  const sourceChannel = member && member.voice ? member.voice.channel : null;
+  if (!isVoiceChannel(sourceChannel)) {
+    await interaction.reply({ content: '전부이동 실패: 먼저 음성 채널에 들어가 주세요.', ephemeral: true });
+    return;
+  }
+
+  const options = buildMoveAllOptions(interaction.guild, sourceChannel);
+  if (!options || options.length === 0) {
+    await interaction.reply({ content: '전부이동 실패: 이동할 수 있는 음성 채널이 없습니다.', ephemeral: true });
+    return;
+  }
+
+  await interaction.reply({
+    content: buildMoveAllContent(sourceChannel, pageIndex, options),
+    components: buildMoveAllComponents(options, pageIndex, interaction.user.id, sourceChannel.id),
+    ephemeral: true,
+  });
+}
+
+async function updateMoveAllMenu(interaction, sourceChannelId, pageIndex) {
+  if (!interaction.guild) return;
+  const sourceChannel = interaction.guild.channels.cache.get(String(sourceChannelId));
+  if (!isVoiceChannel(sourceChannel)) {
+    await interaction.update({ content: '전부이동 실패: 원래 음성 채널을 찾지 못했습니다.', components: [] });
+    return;
+  }
+
+  const options = buildMoveAllOptions(interaction.guild, sourceChannel);
+  await interaction.update({
+    content: buildMoveAllContent(sourceChannel, pageIndex, options),
+    components: buildMoveAllComponents(options, pageIndex, interaction.user.id, sourceChannel.id),
+  });
+}
+
+async function waitForPartyCreatedChannel(guild, userId, createChannelId, sourceChannelId, timeoutMs) {
+  const started = nowMs();
+  while (nowMs() - started < timeoutMs) {
+    let member = guild.members.cache.get(String(userId));
+    try { member = await guild.members.fetch(String(userId)); } catch (e) {}
+    const current = member && member.voice ? member.voice.channel : null;
+    if (current && String(current.id) !== String(createChannelId) && String(current.id) !== String(sourceChannelId)) {
+      return current;
+    }
+    await delay(500);
+  }
+  return null;
+}
+
+async function logMoveAllResult(guild, actorMember, sourceChannel, targetChannel, movedMembers) {
+  if (!guild) return;
+  let logChannel = guild.channels.cache.get(String(MOVEALL_LOG_TEXT_CHANNEL_ID));
+  if (!logChannel) {
+    try { logChannel = await guild.channels.fetch(String(MOVEALL_LOG_TEXT_CHANNEL_ID)); } catch (e) { logChannel = null; }
+  }
+  if (!logChannel || !logChannel.send) return;
+
+  const timeText = formatKSTFromDate(new Date());
+  const actorName = getDisplayNameForLog(actorMember);
+  const movedNames = movedMembers && movedMembers.length > 0
+    ? movedMembers.map((m) => getDisplayNameForLog(m)).join(', ')
+    : '없음';
+  const text = [
+    '**전부이동 기록**',
+    '시간: ' + timeText,
+    '실행자: ' + actorName + ' (' + String(actorMember && actorMember.id ? actorMember.id : '') + ')',
+    '이동 대상: ' + movedNames,
+    '이동 경로: ' + String(sourceChannel && sourceChannel.name ? sourceChannel.name : '') + ' -> ' + String(targetChannel && targetChannel.name ? targetChannel.name : ''),
+  ].join('\n');
+
+  try { await sendLongText(logChannel, text); } catch (e) {}
+}
+
+async function moveMembersToChannel(members, targetChannel) {
+  const moved = [];
+  for (let i = 0; i < members.length; i++) {
+    const mem = members[i];
+    if (!mem || !mem.voice || !mem.voice.channel) continue;
+    if (String(mem.voice.channel.id) === String(targetChannel.id)) {
+      moved.push(mem);
+      continue;
+    }
+    try {
+      await mem.voice.setChannel(targetChannel);
+      moved.push(mem);
+    } catch (e) {
+      console.error('[MoveAll] move failed:', mem.id, e && e.message ? e.message : e);
+    }
+  }
+  return moved;
+}
+
+async function executeMoveAllInteraction(interaction, sourceChannelId, selectedIndex) {
+  const guild = interaction.guild;
+  const actorMember = interaction.member;
+  const sourceChannel = guild.channels.cache.get(String(sourceChannelId));
+  if (!isVoiceChannel(sourceChannel)) {
+    await interaction.update({ content: '전부이동 실패: 원래 음성 채널을 찾지 못했습니다.', components: [] });
+    return;
+  }
+
+  const options = buildMoveAllOptions(guild, sourceChannel);
+  const option = options[selectedIndex];
+  if (!option) {
+    await interaction.update({ content: '전부이동 실패: 선택한 항목을 찾지 못했습니다. 다시 `/전부이동`을 사용해주세요.', components: [] });
+    return;
+  }
+
+  const sourceMembers = Array.from(sourceChannel.members.values()).filter((mem) => mem && mem.user && !mem.user.bot);
+  await interaction.update({ content: '선택됨: ' + option.label + '\n전부이동을 실행합니다.', components: [] });
+
+  let targetChannel = null;
+  if (option.type === 'existing') {
+    targetChannel = guild.channels.cache.get(String(option.channelId));
+    if (!isVoiceChannel(targetChannel)) {
+      await interaction.followUp({ content: '전부이동 실패: 선택한 음성 채널을 찾지 못했습니다.', ephemeral: true });
+      return;
+    }
+  } else if (option.type === 'partyCreate') {
+    const createChannel = guild.channels.cache.get(String(option.channelId));
+    if (!isVoiceChannel(createChannel)) {
+      await interaction.followUp({ content: '전부이동 실패: 파티 생성용 음성 채널을 찾지 못했습니다.', ephemeral: true });
+      return;
+    }
+
+    try {
+      await actorMember.voice.setChannel(createChannel);
+    } catch (e) {
+      await interaction.followUp({ content: '전부이동 실패: 파티 생성 채널로 이동하지 못했습니다. 봇 권한을 확인해주세요.', ephemeral: true });
+      return;
+    }
+
+    await interaction.followUp({ content: option.label + ' 채널로 이동했습니다. 새 파티방 생성 대기 중입니다.', ephemeral: true });
+    targetChannel = await waitForPartyCreatedChannel(guild, interaction.user.id, createChannel.id, sourceChannel.id, 15000);
+    if (!targetChannel) {
+      await interaction.followUp({ content: '전부이동 실패: 새 파티방 생성을 감지하지 못했습니다. 파티비스트가 방을 만든 뒤 다시 시도해주세요.', ephemeral: true });
+      return;
+    }
+  }
+
+  if (!targetChannel || String(targetChannel.id) === String(sourceChannel.id)) {
+    await interaction.followUp({ content: '전부이동 실패: 이동할 대상 채널이 올바르지 않습니다.', ephemeral: true });
+    return;
+  }
+
+  const moved = await moveMembersToChannel(sourceMembers, targetChannel);
+  await logMoveAllResult(guild, actorMember, sourceChannel, targetChannel, moved);
+  await interaction.followUp({ content: '전부이동 완료: ' + moved.length + '명을 "' + String(targetChannel.name || '') + '" 채널로 이동했습니다.', ephemeral: true });
+}
+
+async function handleMoveAllComponent(interaction) {
+  const parts = String(interaction.customId || '').split(':');
+  const action = parts[0];
+  const userId = parts[1];
+  const sourceChannelId = parts[2];
+  const pageIndex = parseInt(parts[3] || '0', 10) || 0;
+
+  if (String(interaction.user.id) !== String(userId)) {
+    await interaction.reply({ content: '이 전부이동 메뉴는 명령어를 실행한 사람만 사용할 수 있습니다.', ephemeral: true });
+    return;
+  }
+
+  if (action === 'moveall_cancel') {
+    await interaction.update({ content: '전부이동을 취소했습니다.', components: [] });
+    return;
+  }
+
+  if (action === 'moveall_page') {
+    await updateMoveAllMenu(interaction, sourceChannelId, pageIndex);
+    return;
+  }
+
+  if (action === 'moveall_select') {
+    const selectedIndex = parseInt(interaction.values && interaction.values[0] ? interaction.values[0] : '-1', 10);
+    await executeMoveAllInteraction(interaction, sourceChannelId, selectedIndex);
+  }
+}
 function parseServiceAccountFromB64() {
   const b64 = getEnv('GOOGLE_SA_JSON_B64');
   const jsonStr = Buffer.from(b64, 'base64').toString('utf8');
@@ -1168,7 +1489,7 @@ function isTargetChannelOrThread(message) {
   const cid = String(message.channel.id);
   if (cid === TARGET_CHANNEL_ID) return true;
 
-  if (message.channel.parentID && String(message.channel.parentID) === TARGET_CHANNEL_ID) {
+  if (getChannelParentId(message.channel) && String(getChannelParentId(message.channel)) === TARGET_CHANNEL_ID) {
     return true;
   }
   return false;
@@ -1394,7 +1715,7 @@ async function fetchLeaveRowsFromChannelText(channel) {
 
     if (!batch || batch.size === 0) break;
 
-    const arr = batch.array();
+    const arr = Array.from(batch.values());
     fetchedCount += arr.length;
 
     for (let i = 0; i < arr.length; i++) {
@@ -1451,7 +1772,7 @@ async function runBackup(invokingMessage) {
     await initSheets();
 
     const ch = await getOrFetchChannel(TARGET_CHANNEL_ID);
-    if (!ch || ch.type !== 'text') {
+    if (!ch || !isTextChannel(ch)) {
       console.error('[Backup] target channel not found or not text:', TARGET_CHANNEL_ID);
       await notify('백업 실패: 대상 채널을 찾지 못했거나 텍스트 채널이 아닙니다.');
       return;
@@ -1551,9 +1872,9 @@ async function renumberCategoryRooms(guildId, categoryId, why) {
   const prefixText = String(cfg.prefix);
   const re = new RegExp('^' + escapeRegex(prefixText) + '\\s*(\\d+)$', 'i');
 
-  const voices = guild.channels.cache
-    .filter((ch) => ch && ch.type === 'voice' && String(ch.parentID) === String(categoryId))
-    .array();
+  const voices = Array.from(guild.channels.cache
+    .filter((ch) => ch && isVoiceChannel(ch) && String(getChannelParentId(ch)) === String(categoryId))
+    .values());
 
   const targets = [];
   for (let i = 0; i < voices.length; i++) {
@@ -1665,12 +1986,12 @@ client.on('ready', async () => {
 client.on('channelCreate', (channel) => {
   try {
     if (!channel) return;
-    if (channel.type !== 'voice') return;
+    if (!isVoiceChannel(channel)) return;
     if (!channel.guild) return;
-    if (!channel.parentID) return;
-    if (!isManagedCategory(channel.parentID)) return;
+    if (!getChannelParentId(channel)) return;
+    if (!isManagedCategory(getChannelParentId(channel))) return;
 
-    scheduleRenumber(channel.guild.id, channel.parentID, 'channelCreate');
+    scheduleRenumber(channel.guild.id, getChannelParentId(channel), 'channelCreate');
   } catch (e) {
     console.error('[channelCreate handler error]', e && e.stack ? e.stack : e);
   }
@@ -1679,12 +2000,12 @@ client.on('channelCreate', (channel) => {
 client.on('channelDelete', (channel) => {
   try {
     if (!channel) return;
-    if (channel.type !== 'voice') return;
+    if (!isVoiceChannel(channel)) return;
     if (!channel.guild) return;
-    if (!channel.parentID) return;
-    if (!isManagedCategory(channel.parentID)) return;
+    if (!getChannelParentId(channel)) return;
+    if (!isManagedCategory(getChannelParentId(channel))) return;
 
-    scheduleRenumber(channel.guild.id, channel.parentID, 'channelDelete');
+    scheduleRenumber(channel.guild.id, getChannelParentId(channel), 'channelDelete');
   } catch (e) {
     console.error('[channelDelete handler error]', e && e.stack ? e.stack : e);
   }
@@ -1694,8 +2015,39 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   enqueueSheetJobByName('filter', () => handleTrackedVoiceTransition(oldState, newState));
 });
 
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand && interaction.isChatInputCommand()) {
+      if (interaction.commandName === '전부이동') {
+        if (!interaction.guild) return;
+        if (!isAdminMember(interaction.member)) {
+          await interaction.reply({ content: '권한이 없다.', ephemeral: true });
+          return;
+        }
+        await replyMoveAllMenu(interaction, 0);
+        return;
+      }
+    }
+
+    if ((interaction.isStringSelectMenu && interaction.isStringSelectMenu()) || (interaction.isButton && interaction.isButton())) {
+      const customId = String(interaction.customId || '');
+      if (customId.indexOf('moveall_') === 0) {
+        await handleMoveAllComponent(interaction);
+      }
+    }
+  } catch (e) {
+    console.error('[InteractionError]', e && e.stack ? e.stack : e);
+    try {
+      if (interaction && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: '처리 중 오류가 발생했습니다. Heroku 로그를 확인해주세요.', ephemeral: true });
+      } else if (interaction && interaction.followUp) {
+        await interaction.followUp({ content: '처리 중 오류가 발생했습니다. Heroku 로그를 확인해주세요.', ephemeral: true });
+      }
+    } catch (ee) {}
+  }
+});
 // 메시지 작성 시
-client.on('message', async (message) => {
+client.on(Events.MessageCreate, async (message) => {
   if (!message || !message.author) return;
   if (message.author.bot) return;
 
@@ -1712,7 +2064,7 @@ client.on('message', async (message) => {
 
       const guild = message.guild;
       const sourceChannel = guild.channels.cache.get(String(pendingMove.sourceChannelId));
-      if (!sourceChannel || sourceChannel.type !== 'voice') {
+      if (!sourceChannel || !isVoiceChannel(sourceChannel)) {
         moveAllStateByUser.delete(String(message.author.id));
         try { await message.reply('전부이동 실패: 원래 음성 채널을 찾지 못했습니다.'); } catch (e) {}
         return;
@@ -1725,18 +2077,18 @@ client.on('message', async (message) => {
       if (mentionMatch) {
         const cid = mentionMatch[1];
         const ch = guild.channels.cache.get(String(cid));
-        if (ch && ch.type === 'voice') targetChannel = ch;
+        if (ch && isVoiceChannel(ch)) targetChannel = ch;
       }
 
       if (!targetChannel && /^[0-9]+$/.test(raw)) {
         const ch = guild.channels.cache.get(String(raw));
-        if (ch && ch.type === 'voice') targetChannel = ch;
+        if (ch && isVoiceChannel(ch)) targetChannel = ch;
       }
 
       if (!targetChannel) {
         const lower = raw.toLowerCase();
         targetChannel = guild.channels.cache.find((ch) => {
-          if (!ch || ch.type !== 'voice') return false;
+          if (!ch || !isVoiceChannel(ch)) return false;
           const name = String(ch.name || '').toLowerCase();
           return name === lower;
         });
@@ -1754,7 +2106,7 @@ client.on('message', async (message) => {
         return;
       }
 
-      const members = sourceChannel.members.array();
+      const members = Array.from(sourceChannel.members.values());
       let movedCount = 0;
 
       for (let i = 0; i < members.length; i++) {
@@ -1950,7 +2302,7 @@ client.on('message', async (message) => {
     if (!message.guild) return;
 
     const waiting = message.guild.channels.cache.get(WAITING_ROOM_VOICE_ID);
-    if (!waiting || waiting.type !== 'voice') {
+    if (!waiting || !isVoiceChannel(waiting)) {
       try { await message.reply('복귀 실패: 대기실 음성채널을 못 찾음.'); } catch (e) {}
       return;
     }
@@ -2004,12 +2356,12 @@ client.on('message', async (message) => {
     }
 
     const SPECTATOR_TAG = /\[관전\]/i;
-    const members = voiceChannel.members
+    const members = Array.from(voiceChannel.members
       .filter(m => {
         const name = m.displayName || m.user.username || '';
         return !m.user.bot && !SPECTATOR_TAG.test(name);
       })
-      .array();
+      .values());
 
     if (members.length < n) {
       return message.reply('음성 채널에 인원이 부족합니다.');
@@ -2130,7 +2482,7 @@ client.on('message', async (message) => {
     latestTeams.forEach((team, i) => {
       const channelId = voiceChannelIds[i];
       const channel = message.guild.channels.cache.get(channelId);
-      if (!channel || channel.type !== 'voice') return;
+      if (!channel || !isVoiceChannel(channel)) return;
 
       for (let j = 0; j < team.length; j++) {
         const memberId = String(team[j]);
@@ -2150,27 +2502,7 @@ client.on('message', async (message) => {
   }
 
   if (command === '전부이동') {
-    if (!message.guild) return;
-    if (!isAdminMember(message.member)) {
-      try { await message.reply('권한이 없다.'); } catch (e) {}
-      return;
-    }
-
-    const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel || voiceChannel.type !== 'voice') {
-      try { await message.reply('전부이동 실패: 먼저 음성 채널에 들어가 주세요.'); } catch (e) {}
-      return;
-    }
-
-    moveAllStateByUser.set(String(message.author.id), {
-      guildId: String(message.guild.id),
-      sourceChannelId: String(voiceChannel.id),
-      createdAtMs: nowMs(),
-    });
-
-    try {
-      await message.reply('어디로 이동할까요? 이동할 음성 채널 이름(또는 채널 멘션, 채널 ID)을 한 번 더 입력해 주세요. (60초 이내)');
-    } catch (e) {}
+    try { await message.reply('이제 전부이동은 `/전부이동` 슬래시 명령어로 사용해주세요. 선택 메뉴가 명령어 사용자에게만 보입니다.'); } catch (e) {}
     return;
   }
 
@@ -2197,13 +2529,13 @@ client.on('message', async (message) => {
     const colors = ['#FF5733', '#C70039', '#900C3F', '#581845', '#2E86C1', '#2ECC71', '#F1C40F', '#8E44AD'];
     const selectedColor = colors[Math.floor(Math.random() * colors.length)];
 
-    const inviteMessage = new Discord.MessageEmbed()
+    const inviteMessage = new EmbedBuilder()
       .setTitle(voice.name + '\n' + remainingMembers + ' 명 구인 구직 중이에요')
       .setColor(selectedColor)
-      .setFooter('해당링크는 1시간 후 자동으로 소멸됩니다.')
+      .setFooter({ text: '해당링크는 1시간 후 자동으로 소멸됩니다.' })
       .setTimestamp();
 
-    message.channel.send(inviteMessage);
+    message.channel.send({ embeds: [inviteMessage] });
     message.channel.send(invite.url + '\n@here');
     return;
   }
