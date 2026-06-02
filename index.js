@@ -93,7 +93,16 @@ for (let i = 0; i < MANAGED_ROOM_CATEGORIES.length; i++) {
 
 // ---- 전부이동 상태 관리 ----
 const moveAllStateByUser = new Map(); // userId -> { guildId, sourceChannelId, createdAtMs }
-const MOVEALL_TIMEOUT_MS = 60000;     // 60초 안에 목적 채널 이름을 받아야 유효
+const MOVEALL_TIMEOUT_MS = 60000;     // 60초 안에 전부이동 선택을 끝내야 유효
+const MOVEALL_LOG_TEXT_CHANNEL_ID = '1460541366168977529';
+const MOVEALL_COMPONENT_TIMEOUT_MS = 120000;
+const MOVEALL_SELECT_PAGE_SIZE = 25;
+const MOVEALL_PARTY_CREATE_OPTIONS = [
+  { label: '일반방 파티 생성', channelId: '1453251022746030273' },
+  { label: '경쟁방 파티 생성', channelId: '1453251464288796743' },
+  { label: '빡겜방 파티 생성', channelId: '1453257883511820420' },
+  { label: '기타게임 파티 생성', channelId: '1453259322355089530' },
+];
 
 const filterTrackedChatChannelIds = new Set(FILTER_CHAT_CHANNEL_IDS.map((v) => String(v)));
 const filterTrackedRecruitChannelIds = new Set(FILTER_RECRUIT_CHANNEL_IDS.map((v) => String(v)));
@@ -136,6 +145,18 @@ function delay(ms) {
 
 function nowMs() {
   return Date.now();
+}
+
+function isVoiceChannel(channel) {
+  return !!(channel && channel.type === ChannelType.GuildVoice);
+}
+
+function isTextChannel(channel) {
+  return !!(channel && channel.type === ChannelType.GuildText);
+}
+
+function getChannelParentId(channel) {
+  return channel && (channel.parentId || channel.parentID) ? String(channel.parentId || channel.parentID) : '';
 }
 
 function isAdminMember(member) {
