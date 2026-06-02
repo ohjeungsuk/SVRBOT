@@ -1271,21 +1271,38 @@ async function sendRecruitMessage(channel, triggerLabel) {
   }
   const theme = getRecruitTheme(channel);
   const memberNames = effectiveMembers.map((member) => String(member.displayName || member.user.username)).join(', ') || '대기 중';
+  const channelName = String(channel.name || '음성채널');
+  const recruitTitle = '[' + theme.label + '] 스쿼드 ' + remainingMembers + '명 모집';
 
   const embed = new EmbedBuilder()
     .setColor(theme.color)
-    .setTitle('같이 할 스쿼드 모집 중')
-    .setDescription('**' + String(channel.name || '음성채널') + '** 에서 ' + theme.tone + '를 기다리고 있어요.')
-    .addFields(
-      { name: '모집 현황', value: currentMembers + '/' + RECRUIT_MAX_MEMBERS + '명 참여 중 · **' + remainingMembers + '명 구인 중**', inline: false },
-      { name: '현재 인원', value: memberNames, inline: false },
-      { name: '방 종류', value: theme.label, inline: true },
-      { name: '초대 링크', value: invite.url, inline: false }
+    .setTitle(recruitTitle)
+    .setDescription(
+      '**' + channelName + '** 에서 ' + theme.tone + '를 기다리고 있습니다.\n' +
+      '아래 초대 카드나 버튼을 누르면 바로 음성 채널에 참가할 수 있습니다.'
     )
-    .setFooter({ text: '관전 표시는 인원 계산에서 제외됩니다 · 링크는 1시간 후 만료됩니다 · ' + String(triggerLabel || 'auto') })
+    .addFields(
+      { name: '모집 현황', value: '**' + currentMembers + '/' + RECRUIT_MAX_MEMBERS + '명 참여 중**\n**' + remainingMembers + '명 더 필요합니다.**', inline: false },
+      { name: '음성 채널', value: '**' + channelName + '**', inline: true },
+      { name: '방 종류', value: '**' + theme.label + '**', inline: true },
+      { name: '현재 인원', value: memberNames, inline: false }
+    )
+    .setFooter({ text: '관전 표시는 인원 계산에서 제외됩니다 · 초대 링크는 1시간 후 만료됩니다 · ' + String(triggerLabel || 'auto') })
     .setTimestamp();
 
-  await recruitTextChannel.send({ content: '@everyone', embeds: [embed], allowedMentions: { parse: ['everyone'] } });
+  const joinRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel('음성 채널 참가하기')
+      .setStyle(ButtonStyle.Link)
+      .setURL(invite.url)
+  );
+
+  await recruitTextChannel.send({
+    content: '@everyone\n' + invite.url,
+    embeds: [embed],
+    components: [joinRow],
+    allowedMentions: { parse: ['everyone'] },
+  });
   recruitLastSentAtByChannelId.set(String(channel.id), now);
   return true;
 }
