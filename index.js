@@ -105,7 +105,7 @@ for (let i = 0; i < MANAGED_ROOM_CATEGORIES.length; i++) {
 }
 
 const RECRUIT_MAX_MEMBERS = 4;
-const RECRUIT_INTERVAL_MS = 10 * 60 * 1000;
+const RECRUIT_INTERVAL_MS = 30 * 60 * 1000;
 const RECRUIT_CREATE_DELAY_MS = 3500;
 const RECRUIT_EVENT_DELAY_MS = 1500;
 const RECRUIT_MIN_REPEAT_GAP_MS = 2 * 60 * 1000;
@@ -1635,7 +1635,7 @@ async function runPeriodicRecruitCheck() {
       const guild = guilds[i];
       const voices = Array.from(guild.channels.cache.filter((ch) => isManagedRecruitVoiceChannel(ch)).values());
       for (let j = 0; j < voices.length; j++) {
-        await sendRecruitMessage(voices[j], '10분 자동 확인');
+        await sendRecruitMessage(voices[j], '30분 자동 확인');
       }
     }
   } catch (e) {
